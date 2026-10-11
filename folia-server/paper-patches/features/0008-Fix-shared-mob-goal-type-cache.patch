@@ -1,0 +1,80 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: PluginsKers <ikers@foxmail.com>
+Date: Sun, 11 Oct 2026 09:50:00 +0800
+Subject: [PATCH] fix: 修复生物目标类型共享缓存的并发写入
+
+diff --git a/src/main/java/com/destroystokyo/paper/entity/ai/MobGoalHelper.java b/src/main/java/com/destroystokyo/paper/entity/ai/MobGoalHelper.java
+--- a/src/main/java/com/destroystokyo/paper/entity/ai/MobGoalHelper.java
++++ b/src/main/java/com/destroystokyo/paper/entity/ai/MobGoalHelper.java
+@@ -22,7 +22,7 @@
+ 
+ public class MobGoalHelper {
+ 
+-    private static final Map<Class<? extends Goal>, Class<? extends Mob>> GENERIC_TYPE_CACHE = new HashMap<>();
++    private static final Map<Class<? extends Goal>, Class<? extends Mob>> GENERIC_TYPE_CACHE = new java.util.concurrent.ConcurrentHashMap<>(); // Folia - shared across region threads
+     public static final Map<Class<? extends net.minecraft.world.entity.Mob>, Class<? extends Mob>> BUKKIT_BRIDGE = Util.make(new LinkedHashMap<>(), map -> {
+         //<editor-fold defaultstate="collapsed" desc="bukkitMap Entities">
+         // Start generate - MobGoalHelper#BUKKIT_BRIDGE
+diff --git a/src/test/java/com/destroystokyo/paper/entity/ai/MobGoalHelperConcurrencyTest.java b/src/test/java/com/destroystokyo/paper/entity/ai/MobGoalHelperConcurrencyTest.java
+new file mode 100644
+--- /dev/null
++++ b/src/test/java/com/destroystokyo/paper/entity/ai/MobGoalHelperConcurrencyTest.java
+@@ -0,0 +1,58 @@
++package com.destroystokyo.paper.entity.ai;
++
++import static org.junit.jupiter.api.Assertions.assertEquals;
++
++import java.util.ArrayList;
++import java.util.List;
++import java.util.Map;
++import java.util.concurrent.CyclicBarrier;
++import java.util.concurrent.Executors;
++import java.util.concurrent.Future;
++import java.util.concurrent.TimeUnit;
++import net.minecraft.world.entity.ai.goal.FloatGoal;
++import net.minecraft.world.entity.ai.goal.Goal;
++import net.minecraft.world.entity.ai.goal.LookAtPlayerGoal;
++import net.minecraft.world.entity.ai.goal.MeleeAttackGoal;
++import net.minecraft.world.entity.ai.goal.RandomStrollGoal;
++import org.bukkit.entity.Creature;
++import org.bukkit.entity.Mob;
++import org.bukkit.support.environment.Normal;
++import org.junit.jupiter.api.Test;
++import org.junit.jupiter.api.Timeout;
++
++@Normal
++class MobGoalHelperConcurrencyTest {
++
++    @Test
++    @Timeout(30)
++    void resolvesColdGoalTypesAcrossRegions() throws Exception {
++        var cacheField = MobGoalHelper.class.getDeclaredField("GENERIC_TYPE_CACHE");
++        cacheField.setAccessible(true);
++        var cache = (Map<?, ?>) cacheField.get(null);
++        List<Class<? extends Goal>> goals = List.of(
++            FloatGoal.class, LookAtPlayerGoal.class, MeleeAttackGoal.class, RandomStrollGoal.class
++        );
++        List<Class<? extends Mob>> expected = List.of(Mob.class, Mob.class, Creature.class, Creature.class);
++
++        try (var executor = Executors.newFixedThreadPool(goals.size())) {
++            for (int attempt = 0; attempt < 100; attempt++) {
++                cache.clear();
++                var start = new CyclicBarrier(goals.size());
++                List<Future<GoalKey<?>>> results = new ArrayList<>();
++                for (var goal : goals) {
++                    results.add(executor.submit(() -> {
++                        start.await(5, TimeUnit.SECONDS);
++                        return MobGoalHelper.getKey(goal);
++                    }));
++                }
++                for (int index = 0; index < goals.size(); index++) {
++                    var key = results.get(index).get(5, TimeUnit.SECONDS);
++                    assertEquals(expected.get(index), key.getEntityClass());
++                    assertEquals(key, MobGoalHelper.getKey(goals.get(index)));
++                }
++            }
++        } finally {
++            cache.clear();
++        }
++    }
++}
