@@ -1,0 +1,71 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Codex <codex@openai.com>
+Date: Sun, 11 Oct 2026 23:25:00 +0800
+Subject: [PATCH] fix: 补偿全局卡顿期间的世界时钟
+
+世界时钟与 gameTime 使用相同的调度补偿量，避免客户端天色持续领先服务端。
+
+diff --git a/io/papermc/paper/threadedregions/RegionizedServer.java b/io/papermc/paper/threadedregions/RegionizedServer.java
+--- a/io/papermc/paper/threadedregions/RegionizedServer.java
++++ b/io/papermc/paper/threadedregions/RegionizedServer.java
+@@ -241,7 +241,7 @@
+         ((FoliaGlobalRegionScheduler)Bukkit.getGlobalRegionScheduler()).tick();
+ 
+         // clock tick
+-        this.tickClocks();
++        this.tickClocks(tickCount);
+ 
+         // commands
+         ((DedicatedServer)MinecraftServer.getServer()).handleConsoleInputs();
+@@ -396,13 +396,13 @@
+         world.getWorldBorder().tick();
+     }
+ 
+-    private void tickClocks() {
++    private void tickClocks(final long tickCount) {
+         // Paper start - per-world time
+         if (io.papermc.paper.configuration.GlobalConfiguration.get().time.affectsAllWorlds) {
+-            MinecraftServer.getServer().clockManager().tick();
++            MinecraftServer.getServer().clockManager().tick(tickCount);
+         } else {
+             for (ServerLevel level : this.worlds) {
+-                level.clockManager().tick();
++                level.clockManager().tick(tickCount);
+             }
+         }
+         // Paper end - per-world time
+diff --git a/net/minecraft/world/clock/ServerClockManager.java b/net/minecraft/world/clock/ServerClockManager.java
+--- a/net/minecraft/world/clock/ServerClockManager.java
++++ b/net/minecraft/world/clock/ServerClockManager.java
+@@ -68,9 +68,14 @@
+     }
+ 
+     public void tick() {
++        this.tick(1L);
++    }
++
++    // Folia - keep clocks aligned with lag-compensated game time.
++    public void tick(final long tickCount) {
+         boolean advanceTime = this.advanceTime(); // Paper - per-world time
+         if (advanceTime) {
+-            this.clocks.values().forEach(ServerClockManager.ClockInstance::tick);
++            this.clocks.values().forEach(instance -> instance.tick(tickCount));
+             this.setDirty();
+         }
+     }
+@@ -215,11 +220,11 @@
+             this.paused = state.paused();
+         }
+ 
+-        public void tick() {
++        public void tick(final long tickCount) {
+             if (!this.paused) {
+-                this.partialTick = this.partialTick + this.rate;
+-                int fullTicks = Mth.floor(this.partialTick);
+-                this.partialTick -= fullTicks;
++                double elapsed = this.partialTick + (double) tickCount * this.rate;
++                long fullTicks = Mth.lfloor(elapsed);
++                this.partialTick = (float) (elapsed - fullTicks);
+                 this.totalTicks += fullTicks;
+             }
+         }
