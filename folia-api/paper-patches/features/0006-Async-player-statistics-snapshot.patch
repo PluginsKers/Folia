@@ -1,0 +1,45 @@
+From 64d46b257c4b70c9c012ce9a487925ac3bfb0dcb Mon Sep 17 00:00:00 2001
+From: PluginsKers <ikers@foxmail.com>
+Date: Wed, 14 Oct 2026 19:07:03 +0800
+Subject: [PATCH] feat: expose asynchronous player statistics snapshots
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+---
+ src/main/java/org/bukkit/OfflinePlayer.java | 19 +++++++++++++++++++
+ 1 file changed, 19 insertions(+)
+
+diff --git a/src/main/java/org/bukkit/OfflinePlayer.java b/src/main/java/org/bukkit/OfflinePlayer.java
+index 13ec9ea1e..20d0f0cef 100644
+--- a/src/main/java/org/bukkit/OfflinePlayer.java
++++ b/src/main/java/org/bukkit/OfflinePlayer.java
+@@ -384,6 +384,25 @@ public interface OfflinePlayer extends ServerOperator, AnimalTamer, Configuratio
+      */
+     public int getStatistic(Statistic statistic) throws IllegalArgumentException;
+ 
++    /**
++     * Reads an immutable snapshot of the requested untyped statistics without
++     * blocking the calling thread. Online statistics are captured together on
++     * the player's owning region. Offline statistics are read once from disk,
++     * after accepted saves, without migrating or modifying the file.
++     *
++     * <p>A player who logs in after the offline read was selected may receive
++     * their last persisted values. A player retiring before the online capture
++     * falls back to the ordered disk read. Missing statistics are zero; a failed
++     * read or a previous failed save completes the future exceptionally.</p>
++     *
++     * <p>Completion callbacks do not imply ownership of any entity or region.</p>
++     *
++     * @param statistics the statistics to read
++     * @return a future containing one value for every requested statistic
++     * @throws IllegalArgumentException if a statistic requires an item, block or entity type
++     */
++    public java.util.concurrent.CompletableFuture<java.util.Map<Statistic, Integer>> getStatisticsAsync(java.util.Set<Statistic> statistics);
++
+     /**
+      * Increments the given statistic for this player for the given material.
+      * <p>
+-- 
+2.53.0.windows.1
+
