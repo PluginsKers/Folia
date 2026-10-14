@@ -1,0 +1,463 @@
+From f8459d7d84862f56d4b172663a8905392b8531f9 Mon Sep 17 00:00:00 2001
+From: PluginsKers <ikers@foxmail.com>
+Date: Wed, 14 Oct 2026 21:01:52 +0800
+Subject: [PATCH] fix: continue village cat spawning and release POI leases
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+---
+ .../patches/poi_lookup/PoiSearchSession.java  | 68 ++++++++++++++++
+ .../patches/poi_lookup/PoiSearchTask.java     | 58 ++------------
+ .../threadedregions/RegionShutdownThread.java | 27 ++++++-
+ .../threadedregions/RegionizedWorldData.java  | 23 +++++-
+ .../paper/threadedregions/TickRegions.java    |  3 +-
+ net/minecraft/server/level/ServerLevel.java   |  1 +
+ .../world/entity/npc/CatSpawner.java          | 77 +++++++++++++++++--
+ 7 files changed, 194 insertions(+), 63 deletions(-)
+ create mode 100644 ca/spottedleaf/moonrise/patches/poi_lookup/PoiSearchSession.java
+
+diff --git a/ca/spottedleaf/moonrise/patches/poi_lookup/PoiSearchSession.java b/ca/spottedleaf/moonrise/patches/poi_lookup/PoiSearchSession.java
+new file mode 100644
+index 0000000..9dc78b7
+--- /dev/null
++++ b/ca/spottedleaf/moonrise/patches/poi_lookup/PoiSearchSession.java
+@@ -0,0 +1,68 @@
++package ca.spottedleaf.moonrise.patches.poi_lookup;
++
++import ca.spottedleaf.moonrise.common.util.CoordinateUtils;
++import ca.spottedleaf.moonrise.common.util.TickThread;
++import ca.spottedleaf.moonrise.patches.chunk_system.level.poi.PoiChunk;
++import ca.spottedleaf.moonrise.patches.chunk_system.scheduling.ChunkHolderManager;
++import it.unimi.dsi.fastutil.longs.Long2ObjectOpenHashMap;
++import java.util.Optional;
++import java.util.concurrent.atomic.AtomicBoolean;
++import net.minecraft.server.level.ServerLevel;
++import net.minecraft.world.entity.ai.village.poi.PoiSection;
++
++/** A host advances on its owner, then closes only after its continuation has finished or retired. */
++public final class PoiSearchSession implements AutoCloseable {
++    private final ServerLevel level;
++    private final ChunkHolderManager manager;
++    private final Long2ObjectOpenHashMap<ChunkHolderManager.PoiChunkLease> leases = new Long2ObjectOpenHashMap<>();
++    private final AtomicBoolean closed = new AtomicBoolean();
++
++    public PoiSearchSession(final ServerLevel level) {
++        this.level = level;
++        this.manager = level.moonrise$getChunkTaskScheduler().chunkHolderManager;
++    }
++
++    public boolean advance(final PoiAccess.Search search) {
++        if (this.closed.get()) throw new IllegalStateException("POI search session is closed");
++        for (final long key : this.leases.keySet()) {
++            if (!TickThread.isTickThreadFor(this.level, CoordinateUtils.getChunkX(key), CoordinateUtils.getChunkZ(key))) throw new LostOwnership();
++        }
++        return search.advance(this::section);
++    }
++
++    private Optional<PoiSection> section(final long sectionKey) {
++        final int x = CoordinateUtils.getChunkSectionX(sectionKey);
++        final int z = CoordinateUtils.getChunkSectionZ(sectionKey);
++        if (!TickThread.isTickThreadFor(this.level, x, z)) throw new LostOwnership();
++        final long chunkKey = CoordinateUtils.getChunkKey(x, z);
++        ChunkHolderManager.PoiChunkLease lease = this.leases.get(chunkKey);
++        if (lease == null) {
++            lease = this.manager.acquirePoiChunk(x, z);
++            this.leases.put(chunkKey, lease);
++        }
++        final PoiChunk chunk = lease.getIfReady();
++        if (chunk == null) return null;
++        chunk.load();
++        return chunk.getSectionForVanilla(CoordinateUtils.getChunkSectionY(sectionKey));
++    }
++
++    @Override
++    public void close() {
++        if (!this.closed.compareAndSet(false, true)) return;
++        Throwable failure = null;
++        for (final ChunkHolderManager.PoiChunkLease lease : this.leases.values()) {
++            try {
++                lease.close();
++            } catch (final Throwable caught) {
++                if (failure == null) failure = caught;
++                else failure.addSuppressed(caught);
++            }
++        }
++        this.leases.clear();
++        if (failure != null) throw new IllegalStateException("Failed to release POI search leases", failure);
++    }
++
++    public static final class LostOwnership extends RuntimeException {
++        private LostOwnership() { super(null, null, false, false); }
++    }
++}
+diff --git a/ca/spottedleaf/moonrise/patches/poi_lookup/PoiSearchTask.java b/ca/spottedleaf/moonrise/patches/poi_lookup/PoiSearchTask.java
+index f9d08fb..57f96ab 100644
+--- a/ca/spottedleaf/moonrise/patches/poi_lookup/PoiSearchTask.java
++++ b/ca/spottedleaf/moonrise/patches/poi_lookup/PoiSearchTask.java
+@@ -1,13 +1,7 @@
+ package ca.spottedleaf.moonrise.patches.poi_lookup;
+ 
+-import ca.spottedleaf.moonrise.common.util.CoordinateUtils;
+ import ca.spottedleaf.moonrise.common.util.TickThread;
+-import ca.spottedleaf.moonrise.patches.chunk_system.level.ChunkSystemServerLevel;
+-import ca.spottedleaf.moonrise.patches.chunk_system.level.poi.PoiChunk;
+-import ca.spottedleaf.moonrise.patches.chunk_system.scheduling.ChunkHolderManager;
+-import it.unimi.dsi.fastutil.longs.Long2ObjectOpenHashMap;
+ import java.util.List;
+-import java.util.Optional;
+ import java.util.function.Consumer;
+ import java.util.function.Predicate;
+ import net.minecraft.core.BlockPos;
+@@ -16,7 +10,6 @@ import net.minecraft.util.Util;
+ import net.minecraft.world.entity.Entity;
+ import net.minecraft.world.entity.Mob;
+ import net.minecraft.world.entity.ai.village.poi.PoiRecord;
+-import net.minecraft.world.entity.ai.village.poi.PoiSection;
+ 
+ /** Resumes a POI cursor on its entity owner while retaining exactly the chunks it has visited. */
+ public final class PoiSearchTask {
+@@ -28,8 +21,7 @@ public final class PoiSearchTask {
+     private final Predicate<Mob> valid;
+     private final Consumer<List<PoiRecord>> complete;
+     private final Runnable finished;
+-    private final ChunkHolderManager manager;
+-    private final Long2ObjectOpenHashMap<ChunkHolderManager.PoiChunkLease> leases = new Long2ObjectOpenHashMap<>();
++    private final PoiSearchSession session;
+ 
+     private PoiSearchTask(final Mob body, final PoiAccess.Search search, final Predicate<Mob> valid,
+                           final Consumer<List<PoiRecord>> complete, final Runnable finished) {
+@@ -41,7 +33,7 @@ public final class PoiSearchTask {
+         this.valid = valid;
+         this.complete = complete;
+         this.finished = finished;
+-        this.manager = ((ChunkSystemServerLevel)this.level).moonrise$getChunkTaskScheduler().chunkHolderManager;
++        this.session = new PoiSearchSession(this.level);
+     }
+ 
+     public static void start(final Mob body, final PoiAccess.Search search, final Predicate<Mob> valid,
+@@ -56,21 +48,17 @@ public final class PoiSearchTask {
+             if (current != this.body || !current.isAlive() || current.isRemoved() || current.level() != this.level
+                 || this.body.isNoAi() || this.body.getBrain() != this.brain
+                 || !current.blockPosition().equals(this.origin) || !this.valid.test(this.body)) return;
+-            // A region may split or the entity may transfer while an IO request is pending.
+-            for (final long key : this.leases.keySet()) {
+-                if (!TickThread.isTickThreadFor(this.level, CoordinateUtils.getChunkX(key), CoordinateUtils.getChunkZ(key))) return;
+-            }
+-            if (this.search.advance(this::section)) {
++            if (this.session.advance(this.search)) {
+                 this.complete.accept(this.search.result());
+             } else {
+                 waiting = this.body.getBukkitEntity().taskScheduler.schedule(this::run, ignored -> this.retired(), 1L);
+             }
+-        } catch (final LostOwnership ignored) {
++        } catch (final PoiSearchSession.LostOwnership ignored) {
+             // Retry from the entity's current region on the next normal AI attempt.
+         } finally {
+             if (!waiting) {
+                 try {
+-                    this.close();
++                    this.session.close();
+                 } finally {
+                     this.finished.run();
+                 }
+@@ -78,42 +66,8 @@ public final class PoiSearchTask {
+         }
+     }
+ 
+-    private Optional<PoiSection> section(final long sectionKey) {
+-        final int x = CoordinateUtils.getChunkSectionX(sectionKey);
+-        final int z = CoordinateUtils.getChunkSectionZ(sectionKey);
+-        if (!TickThread.isTickThreadFor(this.level, x, z)) throw new LostOwnership();
+-        final long chunkKey = CoordinateUtils.getChunkKey(x, z);
+-        ChunkHolderManager.PoiChunkLease lease = this.leases.get(chunkKey);
+-        if (lease == null) {
+-            lease = this.manager.acquirePoiChunk(x, z);
+-            this.leases.put(chunkKey, lease);
+-        }
+-        final PoiChunk chunk = lease.getIfReady();
+-        if (chunk == null) return null;
+-        chunk.load();
+-        return chunk.getSectionForVanilla(CoordinateUtils.getChunkSectionY(sectionKey));
+-    }
+-
+     private void retired() {
+         // Entity retirement runs inside entity removal; ticket changes must happen outside that critical section.
+-        Util.ioPool().execute(this::close);
+-    }
+-
+-    private void close() {
+-        Throwable failure = null;
+-        for (final ChunkHolderManager.PoiChunkLease lease : this.leases.values()) {
+-            try {
+-                lease.close();
+-            } catch (final Throwable caught) {
+-                if (failure == null) failure = caught;
+-                else failure.addSuppressed(caught);
+-            }
+-        }
+-        this.leases.clear();
+-        if (failure != null) throw new IllegalStateException("Failed to release POI search leases", failure);
+-    }
+-
+-    private static final class LostOwnership extends RuntimeException {
+-        private LostOwnership() { super(null, null, false, false); }
++        Util.ioPool().execute(this.session::close);
+     }
+ }
+diff --git a/io/papermc/paper/threadedregions/RegionShutdownThread.java b/io/papermc/paper/threadedregions/RegionShutdownThread.java
+index f2208bc..53661ef 100644
+--- a/io/papermc/paper/threadedregions/RegionShutdownThread.java
++++ b/io/papermc/paper/threadedregions/RegionShutdownThread.java
+@@ -149,11 +149,28 @@ public final class RegionShutdownThread extends ca.spottedleaf.moonrise.common.u
+         }
+     }
+ 
++    static void finishPendingCatSpawns(final ServerLevel world) {
++        world.regioniser.computeForAllRegionsUnsynchronised(region -> {
++            final RegionizedWorldData data = region.getData().getRegionizedData(world.worldRegionData);
++            if (data != null) data.cancelCatSpawn(false);
++        });
++        // Split/merge/destroy may already have detached an attempt under the region lock.
++        // Drain those deferred releases before halting the chunk system they reference.
++        while (world.taskQueueRegionData.hasGlobalChunkTasks()) {
++            try {
++                world.taskQueueRegionData.drainGlobalChunkTasks();
++            } catch (final Throwable failure) {
++                LOGGER.error("Failed to drain global chunk tasks before shutdown", failure);
++            }
++        }
++    }
++
+     @Override
+     public final void run() {
+         // await scheduler termination
+         LOGGER.info("Awaiting scheduler termination for 60s...");
+-        if (TickRegions.getScheduler().halt(true, TimeUnit.SECONDS.toNanos(60L))) {
++        final boolean schedulerHalted = TickRegions.getScheduler().halt(true, TimeUnit.SECONDS.toNanos(60L));
++        if (schedulerHalted) {
+             LOGGER.info("Scheduler halted");
+         } else {
+             LOGGER.warn("Scheduler did not terminate within 60s, proceeding with shutdown anyways");
+@@ -161,6 +178,12 @@ public final class RegionShutdownThread extends ca.spottedleaf.moonrise.common.u
+         }
+ 
+         MinecraftServer.getServer().stopServer(); // stop part 1: most logic, kicking players, plugins, etc
++        // Only quiescent regions can transfer ownership of their pending reads to shutdown.
++        if (schedulerHalted) {
++            for (final ServerLevel world : MinecraftServer.getServer().getAllLevels()) {
++                finishPendingCatSpawns(world);
++            }
++        }
+         // halt all chunk systems first so that any in-progress chunk generation stops
+         LOGGER.info("Halting chunk systems...");
+         for (final ServerLevel world : MinecraftServer.getServer().getAllLevels()) {
+@@ -226,4 +249,4 @@ public final class RegionShutdownThread extends ca.spottedleaf.moonrise.common.u
+         MinecraftServer.getServer().stopPart2(); // stop part 2: close other resources (io thread, etc)
+         // done, part 2 should call exit()
+     }
+-}
+\ No newline at end of file
++}
+diff --git a/io/papermc/paper/threadedregions/RegionizedWorldData.java b/io/papermc/paper/threadedregions/RegionizedWorldData.java
+index c8f13da..7448433 100644
+--- a/io/papermc/paper/threadedregions/RegionizedWorldData.java
++++ b/io/papermc/paper/threadedregions/RegionizedWorldData.java
+@@ -147,6 +147,8 @@ public final class RegionizedWorldData {
+                 }
+             }
+             // mob spawning
++            from.cancelCatSpawn(true);
++            into.cancelCatSpawn(true);
+             into.catSpawnerNextTick = Math.max(from.catSpawnerNextTick, into.catSpawnerNextTick);
+             into.patrolSpawnerNextTick = Math.max(from.patrolSpawnerNextTick, into.patrolSpawnerNextTick);
+             into.phantomSpawnerNextTick = Math.max(from.phantomSpawnerNextTick, into.phantomSpawnerNextTick);
+@@ -300,6 +302,7 @@ public final class RegionizedWorldData {
+                 }
+             }
+             // mob spawning
++            from.cancelCatSpawn(true);
+             for (final RegionizedWorldData regionizedWorldData : dataSet) {
+                 regionizedWorldData.catSpawnerNextTick = from.catSpawnerNextTick;
+                 regionizedWorldData.patrolSpawnerNextTick = from.patrolSpawnerNextTick;
+@@ -419,11 +422,29 @@ public final class RegionizedWorldData {
+     // Mob spawning
+     public final ca.spottedleaf.moonrise.common.misc.PositionCountingAreaMap<ServerPlayer> spawnChunkTracker = new ca.spottedleaf.moonrise.common.misc.PositionCountingAreaMap<>();
+     public int catSpawnerNextTick = 0;
++    public net.minecraft.world.entity.npc.CatSpawner.SpawnAttempt catSpawnAttempt;
+     public int patrolSpawnerNextTick = 0;
+     public int phantomSpawnerNextTick = 0;
+     public VillageSiegeState villageSiegeState = new VillageSiegeState();
+     public WanderingTraderData wanderingTraderData;
+ 
++    public void cancelCatSpawn(final boolean underRegionLock) {
++        final net.minecraft.world.entity.npc.CatSpawner.SpawnAttempt attempt = this.catSpawnAttempt;
++        this.catSpawnAttempt = null;
++        if (attempt == null) return;
++        final Runnable close = () -> {
++            try {
++                attempt.close();
++            } catch (final Throwable failure) {
++                LOGGER.error("Failed to release cat spawning POI leases", failure);
++            }
++        };
++        // Taking ticket/scheduling locks inside a region callback inverts their lock order.
++        // Keep deferred cleanup on the world's existing queue so shutdown can drain it.
++        if (underRegionLock) this.world.taskQueueRegionData.pushGlobalChunkTask(close);
++        else close.run();
++    }
++
+     public static final class VillageSiegeState {
+         public boolean hasSetupSiege;
+         public VillageSiege.State siegeState = VillageSiege.State.SIEGE_DONE;
+@@ -784,4 +805,4 @@ public final class RegionizedWorldData {
+     public int getChunkCount() {
+         return this.chunks.size();
+     }
+-}
+\ No newline at end of file
++}
+diff --git a/io/papermc/paper/threadedregions/TickRegions.java b/io/papermc/paper/threadedregions/TickRegions.java
+index a6ab9cb..ee03ff8 100644
+--- a/io/papermc/paper/threadedregions/TickRegions.java
++++ b/io/papermc/paper/threadedregions/TickRegions.java
+@@ -102,7 +102,8 @@ public final class TickRegions implements ThreadedRegionizer.RegionCallbacks<Tic
+ 
+     @Override
+     public void onRegionDestroy(final ThreadedRegionizer.ThreadedRegion<TickRegionData, TickRegionSectionData> region) {
+-        // nothing for now
++        final RegionizedWorldData worldData = region.getData().getRegionizedData(region.getData().world.worldRegionData);
++        if (worldData != null) worldData.cancelCatSpawn(true);
+         // Folia start - profiler
+         if (region.getData().profiler != null) {
+             region.getData().profiler.stopProfiler();
+diff --git a/net/minecraft/server/level/ServerLevel.java b/net/minecraft/server/level/ServerLevel.java
+index 35ab432..64042fb 100644
+--- a/net/minecraft/server/level/ServerLevel.java
++++ b/net/minecraft/server/level/ServerLevel.java
+@@ -820,6 +820,7 @@ public class ServerLevel extends Level implements WorldGenLevel, ServerEntityGet
+         this.environmentAttributes().invalidateTickCache();
+         TickRateManager tickRateManager = this.tickRateManager();
+         boolean runs = tickRateManager.runsNormally();
++        net.minecraft.world.entity.npc.CatSpawner.cancelIfDisabled(this, regionizedWorldData);
+         if (runs) {
+             profiler.push("world border");
+             //this.getWorldBorder().tick(); // Folia - regionised ticking
+diff --git a/net/minecraft/world/entity/npc/CatSpawner.java b/net/minecraft/world/entity/npc/CatSpawner.java
+index 0e46f86..b36ea48 100644
+--- a/net/minecraft/world/entity/npc/CatSpawner.java
++++ b/net/minecraft/world/entity/npc/CatSpawner.java
+@@ -1,6 +1,11 @@
+ package net.minecraft.world.entity.npc;
+ 
+ import java.util.List;
++import ca.spottedleaf.moonrise.common.util.TickThread;
++import ca.spottedleaf.moonrise.patches.poi_lookup.PoiAccess;
++import ca.spottedleaf.moonrise.patches.poi_lookup.PoiSearchSession;
++import io.papermc.paper.threadedregions.RegionizedWorldData;
++import net.minecraft.world.level.gamerules.GameRules;
+ import net.minecraft.core.BlockPos;
+ import net.minecraft.server.level.ServerLevel;
+ import net.minecraft.tags.StructureTags;
+@@ -22,6 +27,10 @@ public class CatSpawner implements CustomSpawner {
+     @Override
+     public void tick(final ServerLevel level, final boolean spawnEnemies) {
+         final io.papermc.paper.threadedregions.RegionizedWorldData worldData = level.getCurrentWorldData(); // Folia - region threading
++        if (worldData.catSpawnAttempt != null) {
++            this.advanceVillageAttempt(level, worldData);
++            return;
++        }
+         worldData.catSpawnerNextTick--; // Folia - region threading
+         if (worldData.catSpawnerNextTick <= 0) { // Folia - region threading
+             worldData.catSpawnerNextTick = 1200; // Folia - region threading
+@@ -35,7 +44,8 @@ public class CatSpawner implements CustomSpawner {
+                 if (level.hasChunksAt(spawnPos.getX() - 10, spawnPos.getZ() - 10, spawnPos.getX() + 10, spawnPos.getZ() + 10)) {
+                     if (SpawnPlacements.isSpawnPositionOk(EntityTypes.CAT, level, spawnPos)) {
+                         if (level.isCloseToVillage(spawnPos, 2)) {
+-                            this.spawnInVillage(level, spawnPos);
++                            worldData.catSpawnAttempt = new SpawnAttempt(level, spawnPos);
++                            this.advanceVillageAttempt(level, worldData);
+                         } else if (level.structureManager().getStructureWithPieceAt(spawnPos, StructureTags.CATS_SPAWN_IN).isValid()) {
+                             this.spawnInHut(level, spawnPos);
+                         }
+@@ -45,18 +55,71 @@ public class CatSpawner implements CustomSpawner {
+         }
+     }
+ 
+-    private void spawnInVillage(final ServerLevel serverLevel, final BlockPos spawnPos) {
+-        int radius = 48;
+-        if (serverLevel.getPoiManager().getCountInRange(p -> p.is(PoiTypes.HOME), spawnPos, 48, PoiManager.Occupancy.IS_OCCUPIED) > 4L) {
+-            List<Cat> cats = serverLevel.getEntitiesOfClass(Cat.class, new AABB(spawnPos).inflate(48.0, 8.0, 48.0));
+-            if (cats.size() < 5) {
+-                this.spawnCat(spawnPos, serverLevel, false);
++    // Called from the unconditional region tick, even when CustomSpawner ticking is disabled.
++    public static void cancelIfDisabled(final ServerLevel level, final RegionizedWorldData data) {
++        if (data.catSpawnAttempt != null && (!level.tickRateManager().runsNormally()
++            || !level.paperConfig().unsupportedSettings.ticking.chunks || level.isDebug()
++            || !level.getGameRules().get(GameRules.SPAWN_MOBS) || level.getLocalPlayers().isEmpty())) {
++            data.cancelCatSpawn(false);
++        }
++    }
++
++    private void advanceVillageAttempt(final ServerLevel level, final RegionizedWorldData data) {
++        boolean pending = false;
++        try {
++            SpawnAttempt attempt = data.catSpawnAttempt;
++            if (attempt.isValid(level) && !attempt.session.advance(attempt.search)) {
++                pending = true;
++                return;
+             }
++            if (!attempt.isValid(level)) return;
++            // A previously visited section may have changed while another column was loading.
++            // The full first traversal still holds every lease; this second snapshot cannot start disk IO.
++            PoiAccess.AnySearch current = attempt.search(level);
++            if (!attempt.session.advance(current)) throw new IllegalStateException("Leased POI data became unavailable");
++            if (current.result().size() > 4
++                && level.getEntitiesOfClass(Cat.class, new AABB(attempt.pos).inflate(48.0, 8.0, 48.0)).size() < 5) {
++                this.spawnCat(attempt.pos, level, false);
++            }
++        } catch (final PoiSearchSession.LostOwnership ignored) {
++            // An invalidated region attempt is retried by the normal spawning cadence.
++        } finally {
++            if (!pending) data.cancelCatSpawn(false);
++        }
++    }
++
++    public static final class SpawnAttempt implements AutoCloseable {
++        private final BlockPos pos;
++        private final PoiSearchSession session;
++        private final PoiAccess.AnySearch search;
++
++        public SpawnAttempt(final ServerLevel level, final BlockPos pos) {
++            this.pos = pos.immutable();
++            this.session = new PoiSearchSession(level);
++            this.search = this.search(level);
++        }
++
++        private PoiAccess.AnySearch search(final ServerLevel level) {
++            return new PoiAccess.AnySearch(level.getPoiManager(), p -> p.is(PoiTypes.HOME), null, this.pos,
++                48, 48.0 * 48.0, PoiManager.Occupancy.IS_OCCUPIED, Integer.MAX_VALUE);
+         }
++
++        private boolean isValid(final ServerLevel level) {
++            // EntityLookup expands its chunk scan by two blocks beyond the query AABB.
++            return TickThread.isTickThreadFor(level, new AABB(this.pos).inflate(50.0, 8.0, 50.0))
++                && level.getGameRules().get(GameRules.SPAWN_MOBS) && !level.getLocalPlayers().isEmpty()
++                && level.hasChunksAt(this.pos.getX() - 10, this.pos.getZ() - 10, this.pos.getX() + 10, this.pos.getZ() + 10)
++                && SpawnPlacements.isSpawnPositionOk(EntityTypes.CAT, level, this.pos)
++                && level.isCloseToVillage(this.pos, 2);
++        }
++
++        @Override
++        public void close() { this.session.close(); }
+     }
+ 
+     private void spawnInHut(final ServerLevel level, final BlockPos spawnPos) {
+         int radius = 16;
++        if (!TickThread.isTickThreadFor(level, new AABB(spawnPos).inflate(18.0, 8.0, 18.0))) return;
+         List<Cat> cats = level.getEntitiesOfClass(Cat.class, new AABB(spawnPos).inflate(16.0, 8.0, 16.0));
+         if (cats.isEmpty()) {
+             this.spawnCat(spawnPos, level, true);
+-- 
+2.53.0.windows.1
+
