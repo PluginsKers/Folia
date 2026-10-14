@@ -1,0 +1,690 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: PluginsKers <ikers@foxmail.com>
+Date: Wed, 14 Oct 2026 18:00:01 +0800
+Subject: [PATCH] feat: persist player data asynchronously while preserving login order
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+
+diff --git a/io/papermc/paper/threadedregions/RegionShutdownThread.java b/io/papermc/paper/threadedregions/RegionShutdownThread.java
+index f2208bcd5ccf3bd5a428e8ea3bf3ff26b3c9483b..1fe4a908d5de199ffef14da380acf1a931fe7f9e 100644
+--- a/io/papermc/paper/threadedregions/RegionShutdownThread.java
++++ b/io/papermc/paper/threadedregions/RegionShutdownThread.java
+@@ -221,9 +221,14 @@ public final class RegionShutdownThread extends ca.spottedleaf.moonrise.common.u
+         // Note: only save after world data and pending teleportations
+         LOGGER.info("Saving all player data...");
+         MinecraftServer.getServer().getPlayerList().saveAll();
+-        LOGGER.info("Saved all player data");
++        try {
++            MinecraftServer.getServer().getPlayerList().playerIo.closeAsync().join();
++            LOGGER.info("Saved all player data");
++        } catch (java.util.concurrent.CompletionException failure) {
++            LOGGER.error("Failed to save all player data before shutdown", failure);
++        }
+ 
+         MinecraftServer.getServer().stopPart2(); // stop part 2: close other resources (io thread, etc)
+         // done, part 2 should call exit()
+     }
+-}
+\ No newline at end of file
++}
+diff --git a/net/minecraft/network/Connection.java b/net/minecraft/network/Connection.java
+index c3922310ef1fce26eca60793b75bcb480683778a..b37f452a6c419f4c1a3b9627e40a3e1dd2ab3518 100644
+--- a/net/minecraft/network/Connection.java
++++ b/net/minecraft/network/Connection.java
+@@ -77,6 +77,7 @@ public class Connection extends SimpleChannelInboundHandler<Packet<?>> {
+     private volatile @Nullable PacketListener packetListener;
+     private @Nullable DisconnectionDetails disconnectionDetails;
+     private final java.util.concurrent.atomic.AtomicBoolean disconnectionHandled = new java.util.concurrent.atomic.AtomicBoolean(false); // Folia - region threading - may be called concurrently during configuration stage
++    public java.util.concurrent.CompletableFuture<Void> playerDataSave = java.util.concurrent.CompletableFuture.completedFuture(null);
+     private int receivedPackets;
+     private int sentPackets;
+     private float averageReceivedPackets;
+@@ -936,6 +937,18 @@ public class Connection extends SimpleChannelInboundHandler<Packet<?>> {
+ 
+     public void handleDisconnection() {
+         if (this.channel != null && !this.channel.isOpen()) {
++            if (this.disconnectionHandled.get()) {
++                return;
++            }
++            if (this.getPacketListener() instanceof net.minecraft.server.network.ServerGamePacketListenerImpl game
++                && !ca.spottedleaf.moonrise.common.util.TickThread.isTickThreadFor(game.player)) {
++                // The owning region ticks connected and disconnected game connections.
++                return;
++            }
++            if (this.getPacketListener() instanceof net.minecraft.server.network.ServerConfigurationPacketListenerImpl configuration
++                && configuration.deferDisconnection(this::handleDisconnection)) {
++                return;
++            }
+             if (!this.disconnectionHandled.compareAndSet(false, true)) { // Folia - region threading - may be called concurrently during configuration stage
+                 // LOGGER.warn("handleDisconnection() called twice"); // Paper - Don't log useless message
+             } else {
+@@ -970,10 +983,10 @@ public class Connection extends SimpleChannelInboundHandler<Packet<?>> {
+                 // Paper end - Add PlayerConnectionCloseEvent
+                 // Folia start - region threading
+                 if (packetListener instanceof net.minecraft.server.network.ServerCommonPacketListenerImpl commonPacketListener) {
+-                    net.minecraft.server.MinecraftServer.getServer().getPlayerList().removeConnection(
++                    this.playerDataSave.whenComplete((ignored, failure) -> net.minecraft.server.MinecraftServer.getServer().getPlayerList().removeConnection(
+                             commonPacketListener.getOwner().name(),
+                             commonPacketListener.getOwner().id(), this
+-                    );
++                    ));
+                 } else if (packetListener instanceof net.minecraft.server.network.ServerLoginPacketListenerImpl loginPacketListener) {
+                     if (loginPacketListener.state.ordinal() >= net.minecraft.server.network.ServerLoginPacketListenerImpl.State.VERIFYING.ordinal()) {
+                         net.minecraft.server.MinecraftServer.getServer().getPlayerList().removeConnection(
+diff --git a/net/minecraft/server/MinecraftServer.java b/net/minecraft/server/MinecraftServer.java
+index be15a671e0b39b455cd5983f4b90f8f3022a2ebc..87efafe2fca408c82ef434edc5f3c733f6132a82 100644
+--- a/net/minecraft/server/MinecraftServer.java
++++ b/net/minecraft/server/MinecraftServer.java
+@@ -483,6 +483,7 @@ public abstract class MinecraftServer extends ReentrantBlockableEventLoop<TickTa
+         LOGGER.warn("Performing emergency save...");
+         LOGGER.info("Saving all players...");
+         this.getPlayerList().saveAll();
++        this.getPlayerList().playerIo.flushAsync().join();
+         LOGGER.info("Saved all players");
+         LOGGER.info("Saving all worlds...");
+         for (final ServerLevel world : this.getAllLevels()) {
+@@ -1013,6 +1014,7 @@ public abstract class MinecraftServer extends ReentrantBlockableEventLoop<TickTa
+         try {
+             this.isSaving = true;
+             this.getPlayerList().saveAll(); // Paper - Incremental chunk and player saving; diff on change
++            if (flush) this.getPlayerList().playerIo.flushAsync().join();
+             boolean result = this.saveAllChunks(silent, flush, force);
+             this.warnOnLowDiskSpace();
+             return result;
+diff --git a/net/minecraft/server/network/ServerConfigurationPacketListenerImpl.java b/net/minecraft/server/network/ServerConfigurationPacketListenerImpl.java
+index 77c4670868a95dc7b13461dfa67af34b0a3c329a..bbf16722b4257c9e2f84f86ab38996422bf37f3d 100644
+--- a/net/minecraft/server/network/ServerConfigurationPacketListenerImpl.java
++++ b/net/minecraft/server/network/ServerConfigurationPacketListenerImpl.java
+@@ -51,9 +51,10 @@ public class ServerConfigurationPacketListenerImpl extends ServerCommonPacketLis
+     public @Nullable ConfigurationTask currentTask;
+     public ClientInformation clientInformation;
+     private @Nullable SynchronizeRegistriesTask synchronizeRegistriesTask;
+-    private @Nullable PrepareSpawnTask prepareSpawnTask;
++    private volatile @Nullable PrepareSpawnTask prepareSpawnTask;
++    private volatile java.util.concurrent.@Nullable CompletableFuture<net.minecraft.world.level.storage.PlayerDataStorage.LoadedData> pendingSpawnData;
+     public io.papermc.paper.connection.PaperPlayerConfigurationConnection paperConnection; // Paper
+-    public net.minecraft.server.level.ServerPlayer switchToMain; // Folia - region threading - rewrite login process
++    public volatile net.minecraft.server.level.ServerPlayer switchToMain; // Folia - region threading - rewrite login process
+ 
+     public ServerConfigurationPacketListenerImpl(final MinecraftServer server, final Connection connection, final CommonListenerCookie cookie) {
+         super(server, connection, cookie);
+@@ -81,6 +82,7 @@ public class ServerConfigurationPacketListenerImpl extends ServerCommonPacketLis
+ 
+     @Override
+     public void onDisconnect(final DisconnectionDetails details) {
++        this.pendingSpawnData = null;
+         // Paper start - Debugging
+         if (this.server.isDebugging()) {
+             ServerConfigurationPacketListenerImpl.LOGGER.info("{} ({}) lost connection: {}, while in configuration phase {}", this.gameProfile.name(), this.gameProfile.id(), details.reason().getString(), this.currentTask != null ? this.currentTask.type().id() : "null");
+@@ -95,6 +97,21 @@ public class ServerConfigurationPacketListenerImpl extends ServerCommonPacketLis
+         super.onDisconnect(details);
+     }
+ 
++    public boolean deferDisconnection(final Runnable action) {
++        if (ca.spottedleaf.moonrise.common.util.TickThread.isShutdownThread()) {
++            return false;
++        }
++        if (this.switchToMain != null) {
++            final PrepareSpawnTask task = this.prepareSpawnTask;
++            return task != null && task.deferToSpawnRegion(action);
++        }
++        if (!io.papermc.paper.threadedregions.RegionizedServer.isGlobalTickThread()) {
++            this.server.scheduleOnMain(action);
++            return true;
++        }
++        return false;
++    }
++
+     @Override
+     public boolean isAcceptingMessages() {
+         return this.connection.isConnected();
+@@ -212,15 +229,25 @@ public class ServerConfigurationPacketListenerImpl extends ServerCommonPacketLis
+                 return;
+             }
+ 
++            this.pendingSpawnData = playerList.loadPlayerDataAsync(new NameAndId(this.gameProfile));
++        } catch (Exception e) {
++            LOGGER.error("Couldn't load player data", e);
++            this.disconnect(DISCONNECT_REASON_INVALID_DATA);
++        }
++    }
++
++    private void placePlayer(final net.minecraft.world.level.storage.PlayerDataStorage.LoadedData savedData) {
++        try {
+             // Folia start - region threading
+             final Connection connection = this.connection;
++            final PrepareSpawnTask spawnTask = java.util.Objects.requireNonNull(this.prepareSpawnTask);
+             final CommonListenerCookie commonListenerCookie = this.createCookie(this.clientInformation);
+-            final net.minecraft.server.level.ServerPlayer serverPlayer = this.prepareSpawnTask.createPlayer(connection, commonListenerCookie);
++            final net.minecraft.server.level.ServerPlayer serverPlayer = spawnTask.createPlayer(connection, commonListenerCookie);
+ 
+             this.switchToMain = serverPlayer;
+             // now the connection responsibility is transferred to the region
+-            final net.minecraft.server.level.ServerLevel world = this.prepareSpawnTask.getSpawnWorld();
+-            final net.minecraft.world.level.ChunkPos chunkPos = net.minecraft.world.level.ChunkPos.containing(net.minecraft.core.BlockPos.containing(this.prepareSpawnTask.getSpawnPosition()));
++            final net.minecraft.server.level.ServerLevel world = spawnTask.getSpawnWorld();
++            final net.minecraft.world.level.ChunkPos chunkPos = net.minecraft.world.level.ChunkPos.containing(net.minecraft.core.BlockPos.containing(spawnTask.getSpawnPosition()));
+             world.moonrise$getChunkTaskScheduler().scheduleTickingState(
+                     chunkPos.x(), chunkPos.z(), net.minecraft.server.level.FullChunkStatus.ENTITY_TICKING, true,
+                     ca.spottedleaf.concurrentutil.util.Priority.HIGHER,
+@@ -232,8 +259,16 @@ public class ServerConfigurationPacketListenerImpl extends ServerCommonPacketLis
+                         );
+                         io.papermc.paper.threadedregions.RegionizedServer.getInstance().taskQueue.queueTickTaskQueue(
+                                 world, chunkPos.x(), chunkPos.z(), () -> {
+-                                    net.minecraft.server.network.ServerConfigurationPacketListenerImpl.this.prepareSpawnTask.spawnPlayer(
+-                                            this.connection, commonListenerCookie, serverPlayer
++                                    if (!connection.isConnected()) {
++                                        connection.handleDisconnection();
++                                        io.papermc.paper.threadedregions.RegionizedServer.getInstance().removeConnection(connection);
++                                        serverPlayer.retireScheduler();
++                                        serverPlayer.getBukkitEntity().packetProcessor.close();
++                                        serverPlayer.getAdvancements().clearTriggers();
++                                        return;
++                                    }
++                                    spawnTask.spawnPlayer(
++                                            this.connection, commonListenerCookie, serverPlayer, savedData
+                                     );
+                                 }
+                         );
+@@ -249,6 +284,21 @@ public class ServerConfigurationPacketListenerImpl extends ServerCommonPacketLis
+     @Override
+     public void tick() {
+         this.keepConnectionAlive();
++        final var completed = this.pendingSpawnData;
++        if (completed != null && completed.isDone()) {
++            this.pendingSpawnData = null;
++            if (this.isAcceptingMessages()) {
++                try {
++                    this.placePlayer(completed.join());
++                } catch (Exception e) {
++                    LOGGER.error("Couldn't load player data", e);
++                    this.disconnect(DISCONNECT_REASON_INVALID_DATA);
++                }
++            }
++            if (this.switchToMain != null) {
++                return;
++            }
++        }
+         ConfigurationTask task = this.currentTask;
+         if (task != null) {
+             try {
+diff --git a/net/minecraft/server/network/config/PrepareSpawnTask.java b/net/minecraft/server/network/config/PrepareSpawnTask.java
+index 9fad06eda81b4c2c1889a9cfa7a6948e7ee01862..4cdbbeba39fb92f1e3071ee91b10fe1753d858af 100644
+--- a/net/minecraft/server/network/config/PrepareSpawnTask.java
++++ b/net/minecraft/server/network/config/PrepareSpawnTask.java
+@@ -34,7 +34,7 @@ public class PrepareSpawnTask implements ConfigurationTask {
+     private final MinecraftServer server;
+     private final NameAndId nameAndId;
+     private final LevelLoadListener loadListener;
+-    private PrepareSpawnTask.@Nullable State state;
++    private volatile PrepareSpawnTask.@Nullable State state;
+ 
+     // Paper start - passthrough profile and packet listener
+     private final com.mojang.authlib.GameProfile profile;
+@@ -52,10 +52,12 @@ public class PrepareSpawnTask implements ConfigurationTask {
+ 
+     @Override
+     public void start(final Consumer<Packet<?>> connection) {
++        this.state = new Loading(this.server.getPlayerList().loadPlayerDataAsync(this.nameAndId));
++    }
++
++    private void prepare(final net.minecraft.world.level.storage.PlayerDataStorage.LoadedData savedData) {
+         try (ProblemReporter.ScopedCollector reporter = new ProblemReporter.ScopedCollector(LOGGER)) {
+-            Optional<ValueInput> loadedData = this.server
+-                .getPlayerList()
+-                .loadPlayerData(this.nameAndId)
++            Optional<ValueInput> loadedData = savedData.data()
+                 .map(tag -> TagValueInput.create(reporter, this.server.registryAccess(), tag));
+             // Paper start - move logic in Entity to here, to use bukkit supplied world UUID & reset to main world spawn if no valid world is found
+             this.newPlayer = loadedData.isEmpty(); // New players don't have saved data!
+@@ -132,6 +134,10 @@ public class PrepareSpawnTask implements ConfigurationTask {
+     public boolean tick() {
+         return switch (this.state) {
+             case null -> false;
++            case Loading loading -> {
++                if (loading.data().isDone()) this.prepare(loading.data().join());
++                yield false;
++            }
+             case PrepareSpawnTask.Preparing preparing -> {
+                 PrepareSpawnTask.Ready ready = preparing.tick();
+                 if (ready != null) {
+@@ -146,9 +152,9 @@ public class PrepareSpawnTask implements ConfigurationTask {
+         };
+     }
+ 
+-    public ServerPlayer spawnPlayer(final Connection connection, final CommonListenerCookie cookie, final ServerPlayer player) { // Folia - add ServerPlayer param
++    public ServerPlayer spawnPlayer(final Connection connection, final CommonListenerCookie cookie, final ServerPlayer player, final net.minecraft.world.level.storage.PlayerDataStorage.LoadedData savedData) { // Folia - add ServerPlayer param
+         if (this.state instanceof PrepareSpawnTask.Ready ready) {
+-            return ready.spawn(connection, cookie, player); // Folia - add ServerPlayer param
++            return ready.spawn(connection, cookie, player, savedData); // Folia - add ServerPlayer param
+         } else {
+             throw new IllegalStateException("Player spawn was not ready");
+         }
+@@ -187,12 +193,28 @@ public class PrepareSpawnTask implements ConfigurationTask {
+         }
+     }
+ 
++    public boolean deferToSpawnRegion(final Runnable action) {
++        // A single state read remains valid if another caller has already closed the task.
++        if (this.state instanceof PrepareSpawnTask.Ready ready) {
++            ChunkPos chunk = ChunkPos.containing(BlockPos.containing(ready.spawnPosition));
++            if (!ca.spottedleaf.moonrise.common.util.TickThread.isTickThreadFor(ready.spawnLevel, chunk)) {
++                io.papermc.paper.threadedregions.RegionizedServer.getInstance().taskQueue.queueTickTaskQueue(
++                    ready.spawnLevel, chunk.x(), chunk.z(), action
++                );
++                return true;
++            }
++        }
++        return false;
++    }
++
+     public void close() {
+         if (this.state instanceof PrepareSpawnTask.Preparing preparing) {
+             preparing.cancel();
+         }
+ 
+         this.state = null;
++        // PLAYER_SPAWN is shared by chunk, not by player. Stop refreshing it and let
++        // its 20-tick timeout release it without removing another joining player's ticket.
+     }
+ 
+     @Override
+@@ -337,18 +359,16 @@ public class PrepareSpawnTask implements ConfigurationTask {
+             // Folia start - region threading - split out createPlayer and spawn
+             return player;
+         }
+-        public ServerPlayer spawn(final Connection connection, final CommonListenerCookie cookie, final ServerPlayer player) {
++        public ServerPlayer spawn(final Connection connection, final CommonListenerCookie cookie, final ServerPlayer player, final net.minecraft.world.level.storage.PlayerDataStorage.LoadedData savedData) {
+             // Folia end - region threading - split out createPlayer and spawn
+ 
+             try (ProblemReporter.ScopedCollector reporter = new ProblemReporter.ScopedCollector(player.problemPath(), PrepareSpawnTask.LOGGER)) {
+-                Optional<ValueInput> input = PrepareSpawnTask.this.server
+-                    .getPlayerList()
+-                    .loadPlayerData(PrepareSpawnTask.this.nameAndId)
++                Optional<ValueInput> input = savedData.data()
+                     // CraftBukkit start
+                     .map(tag -> {
+                         org.bukkit.craftbukkit.entity.CraftPlayer craftPlayer = player.getBukkitEntity();
+                         // Only update first played if it is older than the one we have
+-                        long modified = new java.io.File(PrepareSpawnTask.this.server.getPlayerList().playerIo.getPlayerDir(), player.getStringUUID() + ".dat").lastModified();
++                        long modified = savedData.modified();
+                         if (modified < craftPlayer.getFirstPlayed()) {
+                             craftPlayer.setFirstPlayed(modified);
+                         }
+@@ -378,6 +398,9 @@ public class PrepareSpawnTask implements ConfigurationTask {
+         }
+     }
+ 
+-    private sealed interface State permits PrepareSpawnTask.Preparing, PrepareSpawnTask.Ready {
++    private record Loading(CompletableFuture<net.minecraft.world.level.storage.PlayerDataStorage.LoadedData> data) implements State {
++    }
++
++    private sealed interface State permits PrepareSpawnTask.Loading, PrepareSpawnTask.Preparing, PrepareSpawnTask.Ready {
+     }
+ }
+diff --git a/net/minecraft/server/players/PlayerList.java b/net/minecraft/server/players/PlayerList.java
+index 259eb7574841b1b885093b534440f8a40db4e8e2..cfffdd5ab2589f0e77e7896aead692d6c49527c1 100644
+--- a/net/minecraft/server/players/PlayerList.java
++++ b/net/minecraft/server/players/PlayerList.java
+@@ -471,19 +471,30 @@ public abstract class PlayerList {
+     }
+ 
+     public Optional<CompoundTag> loadPlayerData(final NameAndId nameAndId) {
++        return this.loadPlayerDataAsync(nameAndId).join().data();
++    }
++
++    public java.util.concurrent.CompletableFuture<PlayerDataStorage.LoadedData> loadPlayerDataAsync(final NameAndId nameAndId) {
+         UUID lastSingleplayerOwnerUUID = this.server.getWorldData().getSinglePlayerUUID();
+         if (this.server.isSingleplayerOwner(nameAndId) && lastSingleplayerOwnerUUID != null) {
+             LOGGER.debug("loading single player");
+-            return this.playerIo.load(new NameAndId(lastSingleplayerOwnerUUID, "<singleplayer owner>"));
++            return this.playerIo.loadWithMetadataAsync(new NameAndId(lastSingleplayerOwnerUUID, "<singleplayer owner>"));
+         } else {
+-            return this.playerIo.load(nameAndId);
++            return this.playerIo.loadWithMetadataAsync(nameAndId);
+         }
+     }
+ 
+     protected void save(final ServerPlayer player) {
+         if (!player.getBukkitEntity().isPersistent()) return; // CraftBukkit
+         player.lastSave = System.nanoTime(); // Folia - region threading - changed to nanoTime tracking
+-        this.playerIo.save(player);
++        if (!org.spigotmc.SpigotConfig.disablePlayerDataSaving) {
++            final String name = player.getPlainTextName();
++            final java.util.concurrent.CompletableFuture<Void> saved = this.playerIo.saveAsync(player);
++            player.connection.connection.playerDataSave = saved;
++            saved.whenComplete((ignored, failure) -> {
++                if (failure != null) LOGGER.error("Failed to save player data for {}", name, failure);
++            });
++        }
+         ServerStatsCounter stats = player.getStats(); // CraftBukkit
+         if (stats != null) {
+             stats.save();
+@@ -1043,6 +1054,9 @@ public abstract class PlayerList {
+             if (!ca.spottedleaf.moonrise.common.util.TickThread.isTickThreadFor(player)) {
+                 continue;
+             }
++            if (interval != -1 && !player.connection.connection.playerDataSave.isDone()) {
++                continue;
++            }
+             // Folia end - region threading
+             if (interval == -1 || now - player.lastSave >= timeInterval) { // Folia - region threading
+                 profiler.startTimer(ca.spottedleaf.leafprofiler.LProfilerRegistry.PLAYER_SAVE); try { // Folia - profiler
+diff --git a/net/minecraft/world/level/storage/PlayerDataStorage.java b/net/minecraft/world/level/storage/PlayerDataStorage.java
+index eddb6ebe3fa50a818e54079b73ba117be0abd195..dfef902ef0544d1dbddd5f72dbbc6f4c75f5f022 100644
+--- a/net/minecraft/world/level/storage/PlayerDataStorage.java
++++ b/net/minecraft/world/level/storage/PlayerDataStorage.java
+@@ -3,11 +3,21 @@ package net.minecraft.world.level.storage;
+ import com.mojang.datafixers.DataFixer;
+ import com.mojang.logging.LogUtils;
+ import java.io.File;
++import java.io.IOException;
+ import java.nio.file.Files;
+ import java.nio.file.Path;
+ import java.nio.file.StandardCopyOption;
+ import java.time.ZonedDateTime;
+ import java.util.Optional;
++import java.util.HashMap;
++import java.util.List;
++import java.util.Map;
++import java.util.UUID;
++import java.util.concurrent.Callable;
++import java.util.concurrent.CompletableFuture;
++import java.util.concurrent.CompletionException;
++import java.util.concurrent.Executor;
++import java.util.concurrent.RejectedExecutionException;
+ import net.minecraft.nbt.CompoundTag;
+ import net.minecraft.nbt.NbtAccounter;
+ import net.minecraft.nbt.NbtIo;
+@@ -18,35 +28,81 @@ import net.minecraft.util.Util;
+ import net.minecraft.util.datafix.DataFixTypes;
+ import net.minecraft.world.entity.player.Player;
+ import org.slf4j.Logger;
++import org.jspecify.annotations.Nullable;
+ 
+ public class PlayerDataStorage {
+     private static final Logger LOGGER = LogUtils.getLogger();
+     private final File playerDir;
+     protected final DataFixer fixerUpper;
++    private final Executor executor;
++    private final Map<UUID, PendingData> pending = new HashMap<>();
++    private boolean closed;
+ 
+     public PlayerDataStorage(final LevelStorageSource.LevelStorageAccess levelAccess, final DataFixer fixerUpper) {
++        this(levelAccess.getLevelPath(LevelResource.PLAYER_DATA_DIR), fixerUpper, Util.ioPool());
++    }
++
++    PlayerDataStorage(final Path playerDir, final DataFixer fixerUpper, final Executor executor) {
+         this.fixerUpper = fixerUpper;
+-        this.playerDir = levelAccess.getLevelPath(LevelResource.PLAYER_DATA_DIR).toFile();
++        this.playerDir = playerDir.toFile();
++        this.executor = executor;
+         this.playerDir.mkdirs();
+     }
+ 
+     public void save(final Player player) {
+         if (org.spigotmc.SpigotConfig.disablePlayerDataSaving) return; // Spigot
++        try {
++            this.saveAsync(player).join();
++        } catch (CompletionException failure) {
++            LOGGER.warn("Failed to save player data for {}", player.getPlainTextName(), failure);
++        }
++    }
++
++    public CompletableFuture<Void> saveAsync(final Player player) {
++        ca.spottedleaf.moonrise.common.util.TickThread.ensureTickThread(player, "Player data must be captured on the owning region");
++        if (org.spigotmc.SpigotConfig.disablePlayerDataSaving) {
++            return CompletableFuture.failedFuture(new IllegalStateException("Player data saving is disabled"));
++        }
+         try (ProblemReporter.ScopedCollector reporter = new ProblemReporter.ScopedCollector(player.problemPath(), LOGGER)) {
+             TagValueOutput output = TagValueOutput.createWithContext(reporter, player.registryAccess());
+             player.saveWithoutId(output);
+-            Path playerDirPath = this.playerDir.toPath();
+-            Path tmpFile = Files.createTempFile(playerDirPath, player.getStringUUID() + "-", ".dat");
+-            CompoundTag dataToStore = output.buildResult();
+-            NbtIo.writeCompressed(dataToStore, tmpFile);
+-            Path realFile = playerDirPath.resolve(player.getStringUUID() + ".dat");
+-            Path oldFile = playerDirPath.resolve(player.getStringUUID() + ".dat_old");
+-            Util.safeReplaceFile(realFile, tmpFile, oldFile);
+-        } catch (Exception ignored) {
+-            LOGGER.warn("Failed to save player data for {}", player.getPlainTextName(), ignored); // Paper - Print exception
++            if (!reporter.isEmpty()) {
++                throw new IllegalStateException("Failed to encode player data: " + reporter.getReport());
++            }
++            return this.saveSnapshotAsync(player.getUUID(), output.buildResult());
++        } catch (Exception failure) {
++            return this.enqueue(player.getUUID(), List.of(player.getUUID()), true, () -> { throw failure; });
+         }
+     }
+ 
++    CompletableFuture<Void> saveSnapshotAsync(final UUID id, final CompoundTag data) {
++        CompoundTag snapshot = data.copy();
++        return this.enqueue(id, List.of(id), true, () -> {
++            Path directory = this.playerDir.toPath();
++            Path temporary = Files.createTempFile(directory, id + "-", ".dat");
++            try {
++                NbtIo.writeCompressed(snapshot, temporary);
++                Path current = directory.resolve(id + ".dat");
++                if (!Util.safeReplaceOrMoveFile(current, temporary, directory.resolve(id + ".dat_old"), false)) {
++                    throw new IOException("Failed to replace player data for " + id);
++                }
++                if (!snapshot.equals(NbtIo.readCompressed(current, NbtAccounter.unlimitedHeap()))) {
++                    throw new IOException("Player data verification failed for " + id);
++                }
++                return null;
++            } finally {
++                Files.deleteIfExists(temporary);
++            }
++        });
++    }
++
++    public CompletableFuture<Optional<CompoundTag>> readCurrentAsync(final UUID id) {
++        return this.enqueue(id, List.of(id), false, () -> {
++            Path current = this.playerDir.toPath().resolve(id + ".dat");
++            return Files.notExists(current) ? Optional.empty() : Optional.of(NbtIo.readCompressed(current, NbtAccounter.unlimitedHeap()));
++        });
++    }
++
+     private void backup(final NameAndId nameAndId, final String suffix) {
+         Path playerDirPath = this.playerDir.toPath();
+         String idString = nameAndId.id().toString();
+@@ -61,47 +117,170 @@ public class PlayerDataStorage {
+         }
+     }
+ 
+-    private Optional<CompoundTag> load(final NameAndId nameAndId, final String suffix) {
+-        File realFile = new File(this.playerDir, nameAndId.id() + suffix);
+-        // Spigot start
+-        boolean usingWrongFile = false;
+-        if (org.bukkit.Bukkit.getOnlineMode() && !realFile.exists()) { // Paper - Check online mode first
+-            realFile = new File(this.playerDir, net.minecraft.core.UUIDUtil.createOfflinePlayerUUID(nameAndId.name()) + suffix);
+-            if (realFile.exists()) {
+-                usingWrongFile = true;
+-                LOGGER.warn("Using offline mode UUID file for player {} as it is the only copy we can find.", nameAndId.name());
++    public Optional<CompoundTag> load(final NameAndId nameAndId) {
++        return this.loadAsync(nameAndId).join();
++    }
++
++    public CompletableFuture<Optional<CompoundTag>> loadAsync(final NameAndId nameAndId) {
++        return this.loadWithMetadataAsync(nameAndId).thenApply(LoadedData::data);
++    }
++
++    public CompletableFuture<LoadedData> loadWithMetadataAsync(final NameAndId nameAndId) {
++        return this.loadWithMetadataAsync(nameAndId, org.bukkit.Bukkit.getOnlineMode());
++    }
++
++    CompletableFuture<LoadedData> loadWithMetadataAsync(final NameAndId nameAndId, final boolean onlineMode) {
++        UUID offlineId = net.minecraft.core.UUIDUtil.createOfflinePlayerUUID(nameAndId.name());
++        List<UUID> ids = onlineMode && !offlineId.equals(nameAndId.id()) ? List.of(nameAndId.id(), offlineId) : List.of(nameAndId.id());
++        return this.enqueue(nameAndId.id(), ids, false, () -> this.loadWithFallback(nameAndId, onlineMode));
++    }
++
++    private LoadedData loadWithFallback(final NameAndId nameAndId, final boolean onlineMode) throws IOException {
++        IOException currentFailure = null;
++        LoadedData loaded;
++        try {
++            loaded = this.loadFile(nameAndId, ".dat", onlineMode);
++        } catch (IOException failure) {
++            LOGGER.warn("Failed to load current player data for {}; trying backup", nameAndId.name(), failure);
++            currentFailure = failure;
++            loaded = new LoadedData(Optional.empty(), 0L);
++        }
++        if (loaded.data().isEmpty()) {
++            this.backup(nameAndId, ".dat");
++            try {
++                loaded = this.loadFile(nameAndId, ".dat_old", onlineMode);
++            } catch (IOException failure) {
++                if (currentFailure != null) failure.addSuppressed(currentFailure);
++                throw failure;
+             }
++            if (loaded.data().isEmpty() && currentFailure != null) throw currentFailure;
+         }
+-        // Spigot end
+-        if (realFile.exists() && realFile.isFile()) {
++        Optional<CompoundTag> converted = loaded.data().map(tag -> {
++            int version = NbtUtils.getDataVersion(tag);
++            return ca.spottedleaf.dataconverter.minecraft.MCDataConverter.convertTag(ca.spottedleaf.dataconverter.minecraft.datatypes.MCTypeRegistry.PLAYER, tag, version, ca.spottedleaf.dataconverter.minecraft.util.Version.getCurrentVersion());
++        });
++        return new LoadedData(converted, loaded.modified());
++    }
++
++    private LoadedData loadFile(final NameAndId nameAndId, final String suffix, final boolean onlineMode) throws IOException {
++        Path current = this.playerDir.toPath().resolve(nameAndId.id() + suffix);
++        Path source = current;
++        if (onlineMode && Files.notExists(source)) {
++            source = this.playerDir.toPath().resolve(net.minecraft.core.UUIDUtil.createOfflinePlayerUUID(nameAndId.name()) + suffix);
++        }
++        if (Files.notExists(source)) return new LoadedData(Optional.empty(), 0L);
++        CompoundTag data;
++        try {
++            data = NbtIo.readCompressed(source, NbtAccounter.unlimitedHeap());
++        } catch (RuntimeException failure) {
++            // Malformed inner tags are reported as unchecked NBT exceptions.
++            throw new IOException("Invalid player data in " + source.getFileName(), failure);
++        }
++        long modified = Files.getLastModifiedTime(source).toMillis();
++        if (!source.equals(current)) {
++            // Keep both login reads on the migrated file before retiring the offline UUID copy.
++            Path temporary = Files.createTempFile(this.playerDir.toPath(), nameAndId.id() + "-", ".dat");
+             try {
+-                // Spigot start
+-                Optional<CompoundTag> optional = Optional.of(NbtIo.readCompressed(realFile.toPath(), NbtAccounter.unlimitedHeap()));
+-                if (usingWrongFile) {
+-                    realFile.renameTo(new File(realFile.getPath() + ".offline-read"));
++                Files.copy(source, temporary, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.COPY_ATTRIBUTES);
++                if (!data.equals(NbtIo.readCompressed(temporary, NbtAccounter.unlimitedHeap()))) {
++                    throw new IOException("Offline player data verification failed for " + nameAndId.id());
+                 }
+-                return optional;
+-                // Spigot end
+-            } catch (Exception ignored) {
+-                LOGGER.warn("Failed to load player data for {}", nameAndId.name());
++                Files.move(temporary, current);
++                if (!data.equals(NbtIo.readCompressed(current, NbtAccounter.unlimitedHeap()))) {
++                    throw new IOException("Migrated player data verification failed for " + nameAndId.id());
++                }
++                Files.move(source, source.resolveSibling(source.getFileName() + ".offline-read"), StandardCopyOption.REPLACE_EXISTING);
++                LOGGER.warn("Migrated offline mode UUID file for player {} as it was the only available copy.", nameAndId.name());
++            } finally {
++                Files.deleteIfExists(temporary);
+             }
+         }
++        return new LoadedData(Optional.of(data), modified);
++    }
+ 
+-        return Optional.empty();
++    private <T> CompletableFuture<T> enqueue(final UUID id, final List<UUID> ids, final boolean write, final Callable<T> action) {
++        final List<PendingData> states;
++        final CompletableFuture<Void> previous;
++        final CompletableFuture<Void> finished = new CompletableFuture<>();
++        synchronized (this.pending) {
++            if (this.closed) return CompletableFuture.failedFuture(new RejectedExecutionException("Player data storage is closed"));
++            states = ids.stream().map(key -> this.pending.computeIfAbsent(key, ignored -> new PendingData())).toList();
++            previous = CompletableFuture.allOf(states.stream().map(state -> state.tail).toArray(CompletableFuture[]::new));
++            states.forEach(state -> state.tail = finished);
++        }
++
++        CompletableFuture<T> result = new CompletableFuture<>();
++        CompletableFuture<T> operation;
++        try {
++            operation = previous.thenApplyAsync(ignored -> {
++                if (!write) {
++                    synchronized (this.pending) {
++                        for (PendingData state : states) {
++                            if (state.failure != null) throw new CompletionException("Previous player save failed for " + id, state.failure);
++                        }
++                    }
++                }
++                try {
++                    return action.call();
++                } catch (Exception failure) {
++                    throw new CompletionException(failure);
++                }
++            }, this.executor);
++        } catch (RuntimeException failure) {
++            operation = CompletableFuture.failedFuture(failure);
++        }
++        operation.whenComplete((value, failure) -> {
++            synchronized (this.pending) {
++                if (write) states.getFirst().failure = failure;
++            }
++            // Release the storage queue before invoking caller continuations.
++            finished.complete(null);
++            synchronized (this.pending) {
++                for (int index = 0; index < ids.size(); index++) {
++                    PendingData state = states.get(index);
++                    if (state.tail == finished && state.failure == null) this.pending.remove(ids.get(index), state);
++                }
++            }
++            if (failure == null) result.complete(value);
++            else result.completeExceptionally(failure);
++        });
++        // The internal completion must survive cancellation of a caller's future.
++        return result.copy();
+     }
+ 
+-    public Optional<CompoundTag> load(final NameAndId nameAndId) {
+-        Optional<CompoundTag> optTag = this.load(nameAndId, ".dat");
+-        if (optTag.isEmpty()) {
+-            this.backup(nameAndId, ".dat");
++    public CompletableFuture<Void> flushAsync() {
++        synchronized (this.pending) {
++            return CompletableFuture.allOf(List.copyOf(this.pending.keySet()).stream()
++                .map(id -> this.enqueue(id, List.of(id), false, () -> null))
++                .toArray(CompletableFuture[]::new));
+         }
++    }
+ 
+-        return optTag.or(() -> this.load(nameAndId, ".dat_old")).map(tag -> {
+-            int version = NbtUtils.getDataVersion(tag);
+-            return ca.spottedleaf.dataconverter.minecraft.MCDataConverter.convertTag(ca.spottedleaf.dataconverter.minecraft.datatypes.MCTypeRegistry.PLAYER, tag, version, ca.spottedleaf.dataconverter.minecraft.util.Version.getCurrentVersion());
++    public CompletableFuture<Void> closeAsync() {
++        final List<PendingData> states;
++        final CompletableFuture<Void> drained;
++        synchronized (this.pending) {
++            this.closed = true;
++            states = List.copyOf(this.pending.values());
++            drained = CompletableFuture.allOf(states.stream().map(state -> state.tail).toArray(CompletableFuture[]::new));
++        }
++        return drained.thenRun(() -> {
++            synchronized (this.pending) {
++                for (PendingData state : states) {
++                    if (state.failure != null) throw new CompletionException("Failed to save all player data before closing", state.failure);
++                }
++            }
+         });
+     }
+ 
++    public record LoadedData(Optional<CompoundTag> data, long modified) {
++    }
++
++    private static final class PendingData {
++        CompletableFuture<Void> tail = CompletableFuture.completedFuture(null);
++        @Nullable Throwable failure;
++    }
++
+     // CraftBukkit start
+     public File getPlayerDir() {
+         return this.playerDir;
