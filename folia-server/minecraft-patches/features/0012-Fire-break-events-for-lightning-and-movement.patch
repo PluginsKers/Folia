@@ -1,0 +1,59 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: PluginsKers <ikers@foxmail.com>
+Date: Fri, 16 Oct 2026 01:39:21 +0800
+Subject: [PATCH] fix: fire break events for lightning and movement
+
+
+diff --git a/net/minecraft/world/entity/decoration/BlockAttachedEntity.java b/net/minecraft/world/entity/decoration/BlockAttachedEntity.java
+index 0526ac2faf920185ec8079d7f5b7969b92a8b2c0..2531d98b062e7546eeb8d1414b47dfc71823900d 100644
+--- a/net/minecraft/world/entity/decoration/BlockAttachedEntity.java
++++ b/net/minecraft/world/entity/decoration/BlockAttachedEntity.java
+@@ -182,14 +182,21 @@ public abstract class BlockAttachedEntity extends Entity {
+         if (this.level() instanceof ServerLevel level && !this.isRemoved() && delta.lengthSqr() > 0.0) {
+             // CraftBukkit start - fire break events
+             // TODO - Does this need its own cause? Seems to only be triggered by pistons
++            boolean cancelled = false; // Folia - retain the hanging event result for the general break event
+             if (this.getBukkitEntity() instanceof org.bukkit.entity.Hanging hanging) {
+                 org.bukkit.event.hanging.HangingBreakEvent event = new org.bukkit.event.hanging.HangingBreakEvent(hanging, org.bukkit.event.hanging.HangingBreakEvent.RemoveCause.PHYSICS);
+                 this.level().getCraftServer().getPluginManager().callEvent(event);
+-
+-                if (this.isRemoved() || event.isCancelled()) {
+-                    return;
+-                }
++                cancelled = event.isCancelled(); // Folia - general break event
++            }
++            // Folia start - fire general break events for movement
++            final io.papermc.paper.event.entity.EntityBreakEvent event = new io.papermc.paper.event.entity.EntityBreakEvent(
++                this.getBukkitEntity(), io.papermc.paper.event.entity.EntityBreakEvent.RemoveCause.PHYSICS
++            );
++            event.setCancelled(cancelled);
++            if (!event.callEvent() || this.isRemoved()) {
++                return;
+             }
++            // Folia end - fire general break events for movement
+             // CraftBukkit end
+             this.kill(level);
+             this.dropItem(level, null);
+diff --git a/net/minecraft/world/entity/decoration/Cushion.java b/net/minecraft/world/entity/decoration/Cushion.java
+index fb1894ac6eb99b60544f6ac2a13de86f045422ef..60e43b75ed970a9df525bbfd78aefe392b585ab3 100644
+--- a/net/minecraft/world/entity/decoration/Cushion.java
++++ b/net/minecraft/world/entity/decoration/Cushion.java
+@@ -143,7 +143,17 @@ public class Cushion extends BlockAttachedEntity {
+     @Override
+     public void thunderHit(final ServerLevel level, final LightningBolt lightningBolt) {
+         if (!this.isRemoved()) {
+-            this.kill(level, this.damageSources().lightningBolt()); // Paper - Backport MC-311924 fix
++            // Folia start - fire break events for lightning
++            final DamageSource source = this.damageSources().lightningBolt();
++            final io.papermc.paper.event.entity.EntityBreakByEntityEvent event = new io.papermc.paper.event.entity.EntityBreakByEntityEvent(
++                this.getBukkitEntity(), lightningBolt.getBukkitEntity(), new org.bukkit.craftbukkit.damage.CraftDamageSource(source),
++                io.papermc.paper.event.entity.EntityBreakEvent.RemoveCause.ENTITY
++            );
++            if (!event.callEvent() || this.isRemoved()) {
++                return;
++            }
++            this.kill(level, source); // Paper - Backport MC-311924 fix
++            // Folia end - fire break events for lightning
+             this.dropItem(level, lightningBolt);
+         }
+     }
