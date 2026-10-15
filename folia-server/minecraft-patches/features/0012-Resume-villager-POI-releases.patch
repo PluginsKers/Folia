@@ -1,0 +1,371 @@
+From 1c830b40a529450daeec93ae8bb3a4a17ab6d9d8 Mon Sep 17 00:00:00 2001
+From: PluginsKers <ikers@foxmail.com>
+Date: Thu, 15 Oct 2026 23:20:00 +0800
+Subject: [PATCH] fix: preserve accepted villager POI releases on 26.3
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+---
+
+diff --git a/ca/spottedleaf/moonrise/patches/chunk_system/scheduling/ChunkHolderManager.java b/ca/spottedleaf/moonrise/patches/chunk_system/scheduling/ChunkHolderManager.java
+index 8b06d0c893e07c969d35c4d7528927552c27b48b..ae378ccbeb77a312d241c5defe77fe12553de063 100644
+--- a/ca/spottedleaf/moonrise/patches/chunk_system/scheduling/ChunkHolderManager.java
++++ b/ca/spottedleaf/moonrise/patches/chunk_system/scheduling/ChunkHolderManager.java
+@@ -1173,6 +1173,79 @@ public final class ChunkHolderManager {
+         return null;
+     }
+ 
++    public PoiChunkLease acquirePoiChunk(final int chunkX, final int chunkZ) {
++        final PoiChunkLease lease = new PoiChunkLease(chunkX, chunkZ);
++        try {
++            final ReentrantAreaLock.Node ticketLock = this.ticketLockArea.lock(chunkX, chunkZ);
++            try {
++                this.addTicketAtLevel(ChunkTaskScheduler.POI_LOAD, chunkX, chunkZ, MAX_TICKET_LEVEL, lease.id);
++                final ReentrantAreaLock.Node schedulingLock = this.taskScheduler.schedulingLockArea.lock(chunkX, chunkZ);
++                try {
++                    final NewChunkHolder holder = this.getOrCreateChunkHolder(chunkX, chunkZ);
++                    final PoiChunk loaded = holder.getPoiChunk();
++                    if (loaded != null) {
++                        lease.ready.complete(loaded);
++                    } else {
++                        lease.task = holder.getOrLoadPoiData(result -> {
++                            if (result.right() != null) lease.ready.completeExceptionally(result.right());
++                            else lease.ready.complete(result.left());
++                        });
++                    }
++                } finally {
++                    this.taskScheduler.schedulingLockArea.unlock(schedulingLock);
++                }
++            } finally {
++                this.ticketLockArea.unlock(ticketLock);
++            }
++            if (lease.task != null) lease.task.schedule();
++            return lease;
++        } catch (final Throwable failure) {
++            try {
++                lease.close();
++            } catch (final Throwable cleanupFailure) {
++                failure.addSuppressed(cleanupFailure);
++            }
++            throw failure;
++        }
++    }
++
++    public final class PoiChunkLease implements AutoCloseable {
++        private final int chunkX, chunkZ;
++        private final Long id = ChunkTaskScheduler.getNextPoiLoadId();
++        private final AtomicBoolean closed = new AtomicBoolean();
++        private final java.util.concurrent.CompletableFuture<PoiChunk> ready = new java.util.concurrent.CompletableFuture<>();
++        private NewChunkHolder.GenericDataLoadTaskCallback task;
++
++        private PoiChunkLease(final int chunkX, final int chunkZ) {
++            this.chunkX = chunkX;
++            this.chunkZ = chunkZ;
++        }
++
++        // Loading the result into the world and accessing its sections still require the owning region.
++        public PoiChunk getIfReady() {
++            if (this.closed.get()) throw new IllegalStateException("POI lease is closed");
++            return this.ready.getNow(null);
++        }
++
++        public boolean isReady() {
++            return this.ready.isDone();
++        }
++
++        public void whenReady(final Runnable action) {
++            this.ready.whenComplete((chunk, failure) -> action.run());
++        }
++
++        @Override
++        public void close() {
++            if (!this.closed.compareAndSet(false, true)) return;
++            try {
++                if (this.task != null) this.task.cancel();
++            } finally {
++                ChunkHolderManager.this.removeTicketAtLevel(ChunkTaskScheduler.POI_LOAD, this.chunkX, this.chunkZ, MAX_TICKET_LEVEL, this.id);
++            }
++        }
++    }
++
+     public PoiChunk loadPoiChunk(final int chunkX, final int chunkZ) {
+         TickThread.ensureTickThread(this.world, chunkX, chunkZ, "Cannot create poi chunk off-main");
+         PoiChunk ret;
+diff --git a/io/papermc/paper/threadedregions/RegionShutdownThread.java b/io/papermc/paper/threadedregions/RegionShutdownThread.java
+index f2208bc..6f13295 100644
+--- a/io/papermc/paper/threadedregions/RegionShutdownThread.java
++++ b/io/papermc/paper/threadedregions/RegionShutdownThread.java
+@@ -95,12 +95,13 @@ public final class RegionShutdownThread extends ca.spottedleaf.moonrise.common.u
+     }
+ 
+     private void saveRegionChunks(final ThreadedRegionizer.ThreadedRegion<TickRegions.TickRegionData, TickRegions.TickRegionSectionData> region,
+-                                  final boolean last) {
++                                  final boolean last, final boolean schedulerHalted) {
+         ChunkPos center = null;
+         try {
+             this.shuttingDown = region;
+             center = region.getCenterChunk();
+             LOGGER.info("Saving chunks around region around chunk " + center + " in world '" + region.regioniser.world.getWorld().getName() + "'");
++            if (schedulerHalted) region.regioniser.world.getPoiManager().finishPendingReleases();
+             region.regioniser.world.moonrise$getChunkTaskScheduler().chunkHolderManager.close(true, true, false, last, false);
+         } catch (final Throwable thr) {
+             LOGGER.error("Failed to save chunks for region around chunk " + center + " in world '" + region.regioniser.world.getWorld().getName() + "'", thr);
+@@ -153,7 +154,8 @@ public final class RegionShutdownThread extends ca.spottedleaf.moonrise.common.u
+     public final void run() {
+         // await scheduler termination
+         LOGGER.info("Awaiting scheduler termination for 60s...");
+-        if (TickRegions.getScheduler().halt(true, TimeUnit.SECONDS.toNanos(60L))) {
++        final boolean schedulerHalted = TickRegions.getScheduler().halt(true, TimeUnit.SECONDS.toNanos(60L));
++        if (schedulerHalted) {
+             LOGGER.info("Scheduler halted");
+         } else {
+             LOGGER.warn("Scheduler did not terminate within 60s, proceeding with shutdown anyways");
+@@ -161,6 +163,12 @@ public final class RegionShutdownThread extends ca.spottedleaf.moonrise.common.u
+         }
+ 
+         MinecraftServer.getServer().stopServer(); // stop part 1: most logic, kicking players, plugins, etc
++        if (schedulerHalted) {
++            final long poiDeadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(60L);
++            for (final ServerLevel world : MinecraftServer.getServer().getAllLevels()) {
++                world.getPoiManager().awaitPendingReleases(poiDeadline);
++            }
++        }
+         // halt all chunk systems first so that any in-progress chunk generation stops
+         LOGGER.info("Halting chunk systems...");
+         for (final ServerLevel world : MinecraftServer.getServer().getAllLevels()) {
+@@ -203,7 +211,7 @@ public final class RegionShutdownThread extends ca.spottedleaf.moonrise.common.u
+ 
+             LOGGER.info("Saving chunks...");
+             for (int i = 0, len = regions.size(); i < len; ++i) {
+-                this.saveRegionChunks(regions.get(i), (i + 1) == len);
++                this.saveRegionChunks(regions.get(i), (i + 1) == len, schedulerHalted);
+             }
+             LOGGER.info("Saved chunks");
+ 
+diff --git a/net/minecraft/world/entity/ai/behavior/GoToPotentialJobSite.java b/net/minecraft/world/entity/ai/behavior/GoToPotentialJobSite.java
+index 8375aa0..b1cc4b6 100644
+--- a/net/minecraft/world/entity/ai/behavior/GoToPotentialJobSite.java
++++ b/net/minecraft/world/entity/ai/behavior/GoToPotentialJobSite.java
+@@ -7,7 +7,6 @@ import net.minecraft.core.GlobalPos;
+ import net.minecraft.server.level.ServerLevel;
+ import net.minecraft.world.entity.ai.memory.MemoryModuleType;
+ import net.minecraft.world.entity.ai.memory.MemoryStatus;
+-import net.minecraft.world.entity.ai.village.poi.PoiManager;
+ import net.minecraft.world.entity.npc.villager.Villager;
+ import net.minecraft.world.entity.schedule.Activity;
+ 
+@@ -45,14 +44,7 @@ public class GoToPotentialJobSite extends Behavior<Villager> {
+             BlockPos pos = globalPos.pos();
+             ServerLevel serverLevel = level.getServer().getLevel(globalPos.dimension());
+             if (serverLevel != null) {
+-                io.papermc.paper.threadedregions.RegionizedServer.getInstance().taskQueue.queueOrExecuteTickTask(serverLevel, pos.getX() >> 4, pos.getZ() >> 4, () -> { // Folia - region threading
+-                PoiManager manager = serverLevel.getPoiManager();
+-                if (manager.exists(pos, p -> true)) {
+-                    manager.release(pos);
+-                }
+-
+-                level.debugSynchronizers().updatePoi(pos);
+-                }); // Folia - region threading
++                serverLevel.getPoiManager().releaseWhenLoaded(pos, p -> true, true);
+             }
+         });
+         body.getBrain().eraseMemory(MemoryModuleType.POTENTIAL_JOB_SITE);
+diff --git a/net/minecraft/world/entity/ai/village/poi/PoiManager.java b/net/minecraft/world/entity/ai/village/poi/PoiManager.java
+index 816fae8..a7954d0 100644
+--- a/net/minecraft/world/entity/ai/village/poi/PoiManager.java
++++ b/net/minecraft/world/entity/ai/village/poi/PoiManager.java
+@@ -48,6 +48,8 @@ public class PoiManager extends SectionStorage<PoiSection, PoiSection.Packed> im
+ 
+     // Paper start - rewrite chunk system
+     private final net.minecraft.server.level.ServerLevel world;
++    private static final org.slf4j.Logger RELEASE_LOGGER = com.mojang.logging.LogUtils.getLogger();
++    private final java.util.Set<PendingRelease> pendingReleases = java.util.concurrent.ConcurrentHashMap.newKeySet();
+ 
+     // the vanilla tracker needs to be replaced because it does not support level removes, and we need level removes
+     // to support poi unloading
+@@ -408,6 +410,143 @@ public class PoiManager extends SectionStorage<PoiSection, PoiSection.Packed> im
+             .orElseThrow(() -> Util.pauseInIde(new IllegalStateException("POI never registered at " + pos)));
+     }
+ 
++    /** Accepts one release, independent of the entity's subsequent memory or lifetime. */
++    public void releaseWhenLoaded(final BlockPos position, final Predicate<Holder<PoiType>> predicate, final boolean updateWhenAbsent) {
++        final BlockPos pos = position.immutable();
++        final int chunkX = pos.getX() >> 4, chunkZ = pos.getZ() >> 4;
++        final var queue = io.papermc.paper.threadedregions.RegionizedServer.getInstance().taskQueue;
++        if (this.world.isOutsideBuildHeight(pos)) {
++            if (updateWhenAbsent) queue.queueOrExecuteTickTask(this.world, chunkX, chunkZ, () -> this.world.debugSynchronizers().updatePoi(pos));
++            return;
++        }
++        final var manager = this.world.moonrise$getChunkTaskScheduler().chunkHolderManager;
++        final boolean ownsRegion = io.papermc.paper.threadedregions.TickRegionScheduler.getCurrentRegion() != null
++            && ca.spottedleaf.moonrise.common.util.TickThread.isTickThreadFor(this.world, chunkX, chunkZ);
++        if (ownsRegion
++            && manager.getPoiChunkIfLoaded(chunkX, chunkZ, true) != null) {
++            this.releaseMatching(pos, predicate, updateWhenAbsent);
++            return;
++        }
++
++        final var lease = manager.acquirePoiChunk(chunkX, chunkZ);
++        final PendingRelease pending;
++        try {
++            pending = new PendingRelease(pos, predicate, updateWhenAbsent, lease);
++            this.pendingReleases.add(pending);
++        } catch (final Throwable failure) {
++            try {
++                lease.close();
++            } catch (final Throwable cleanupFailure) {
++                failure.addSuppressed(cleanupFailure);
++            }
++            throw failure;
++        }
++        if (lease.isReady() && ownsRegion) {
++            pending.task.execute();
++        } else {
++            lease.whenReady(pending::queue);
++        }
++    }
++
++    private void releaseMatching(final BlockPos pos, final Predicate<Holder<PoiType>> predicate, final boolean updateWhenAbsent) {
++        final boolean matches = this.getType(pos).filter(predicate).isPresent();
++        if (matches) this.release(pos);
++        if (matches || updateWhenAbsent) this.world.debugSynchronizers().updatePoi(pos);
++    }
++
++    // Wait before halting the load executor: halting it does not execute queued POI parsing tasks.
++    public void awaitPendingReleases(final long deadlineNanos) {
++        if (!ca.spottedleaf.moonrise.common.util.TickThread.isShutdownThread()) throw new IllegalStateException("Waiting for POI releases outside shutdown");
++        for (final PendingRelease pending : this.pendingReleases) {
++            try {
++                // The handoff includes queueing its region task, not only completing the disk read.
++                pending.dispatched.get(Math.max(0L, deadlineNanos - System.nanoTime()), java.util.concurrent.TimeUnit.NANOSECONDS);
++            } catch (final Exception failure) {
++                if (failure instanceof InterruptedException) Thread.currentThread().interrupt();
++                try {
++                    pending.cancel();
++                } catch (final Throwable cleanupFailure) {
++                    failure.addSuppressed(cleanupFailure);
++                }
++                RELEASE_LOGGER.error("POI release did not reach its region before shutdown at {}", pending.pos, failure);
++            }
++        }
++    }
++
++    // Called in the existing shutdown region scope immediately before saving that region.
++    public void finishPendingReleases() {
++        if (!ca.spottedleaf.moonrise.common.util.TickThread.isShutdownThread()
++            || io.papermc.paper.threadedregions.TickRegionScheduler.getCurrentRegion() == null) {
++            throw new IllegalStateException("Draining POI releases outside a shutdown region");
++        }
++        for (final PendingRelease pending : this.pendingReleases) {
++            if (!ca.spottedleaf.moonrise.common.util.TickThread.isTickThreadFor(this.world, pending.pos)) continue;
++            try {
++                pending.task.execute();
++            } catch (final Throwable failure) {
++                RELEASE_LOGGER.error("Failed to release POI before saving at {}", pending.pos, failure);
++            }
++        }
++    }
++
++    private final class PendingRelease {
++        private final BlockPos pos;
++        private final Predicate<Holder<PoiType>> predicate;
++        private final boolean updateWhenAbsent;
++        private final ca.spottedleaf.moonrise.patches.chunk_system.scheduling.ChunkHolderManager.PoiChunkLease lease;
++        private final ca.spottedleaf.concurrentutil.executor.PrioritisedExecutor.PrioritisedTask task;
++        private final java.util.concurrent.CompletableFuture<Void> dispatched = new java.util.concurrent.CompletableFuture<>();
++
++        private PendingRelease(final BlockPos pos, final Predicate<Holder<PoiType>> predicate, final boolean updateWhenAbsent,
++                               final ca.spottedleaf.moonrise.patches.chunk_system.scheduling.ChunkHolderManager.PoiChunkLease lease) {
++            this.pos = pos;
++            this.predicate = predicate;
++            this.updateWhenAbsent = updateWhenAbsent;
++            this.lease = lease;
++            this.task = io.papermc.paper.threadedregions.RegionizedServer.getInstance().taskQueue
++                .createTickTaskQueue(PoiManager.this.world, pos.getX() >> 4, pos.getZ() >> 4, this::run);
++        }
++
++        private void queue() {
++            try {
++                this.task.queue();
++                this.dispatched.complete(null);
++            } catch (final Throwable failure) {
++                try {
++                    this.cancel();
++                } catch (final Throwable cleanupFailure) {
++                    failure.addSuppressed(cleanupFailure);
++                }
++                this.dispatched.completeExceptionally(failure);
++                RELEASE_LOGGER.error("Failed to schedule POI release at {}", this.pos, failure);
++            }
++        }
++
++        private void run() {
++            try {
++                ca.spottedleaf.moonrise.common.util.TickThread.ensureTickThread(PoiManager.this.world, this.pos, "Releasing POI off owner");
++                final var chunk = this.lease.getIfReady();
++                if (chunk == null) throw new IllegalStateException("POI release ran before its read completed");
++                chunk.load();
++                PoiManager.this.releaseMatching(this.pos, this.predicate, this.updateWhenAbsent);
++            } finally {
++                this.close();
++            }
++        }
++
++        private void cancel() {
++            if (this.task.cancel()) this.close();
++        }
++
++        private void close() {
++            try {
++                this.lease.close();
++            } finally {
++                PoiManager.this.pendingReleases.remove(this);
++            }
++        }
++    }
++
+     public boolean exists(final BlockPos pos, final Predicate<Holder<PoiType>> predicate) {
+         return this.getOrLoad(SectionPos.asLong(pos)).map(s -> s.exists(pos, predicate)).orElse(false);
+     }
+diff --git a/net/minecraft/world/entity/npc/villager/Villager.java b/net/minecraft/world/entity/npc/villager/Villager.java
+index 0869ecb..7a33e6d 100644
+--- a/net/minecraft/world/entity/npc/villager/Villager.java
++++ b/net/minecraft/world/entity/npc/villager/Villager.java
+@@ -171,11 +171,11 @@ public class Villager extends AbstractVillager implements VillagerDataHolder, Re
+             return activities;
+         }
+     );
+-    public static final Map<MemoryModuleType<GlobalPos>, BiPredicate<Villager, Holder<PoiType>>> POI_MEMORIES = ImmutableMap.of(
++    public static final Map<MemoryModuleType<GlobalPos>, BiPredicate<VillagerData, Holder<PoiType>>> POI_MEMORIES = ImmutableMap.of(
+         MemoryModuleType.HOME,
+         (villager, poiType) -> poiType.is(PoiTypes.HOME),
+         MemoryModuleType.JOB_SITE,
+-        (villager, poiType) -> villager.getVillagerData().profession().value().heldJobSite().test(poiType),
++        (data, poiType) -> data.profession().value().heldJobSite().test(poiType),
+         MemoryModuleType.POTENTIAL_JOB_SITE,
+         (villager, poiType) -> VillagerProfession.ALL_ACQUIRABLE_JOBS.test(poiType),
+         MemoryModuleType.MEETING_POINT,
+@@ -674,15 +674,10 @@ public class Villager extends AbstractVillager implements VillagerDataHolder, Re
+             this.brain.getMemory(memoryType).ifPresent(memory -> {
+                 ServerLevel poiLevel = server.getLevel(memory.dimension());
+                 if (poiLevel != null) {
+-                    io.papermc.paper.threadedregions.RegionizedServer.getInstance().taskQueue.queueOrExecuteTickTask(poiLevel, memory.pos().getX() >> 4, memory.pos().getZ() >> 4, () -> { // Folia - region threading
+-                    PoiManager poiManager = poiLevel.getPoiManager();
+-                    Optional<Holder<PoiType>> type = poiManager.getType(memory.pos());
+-                    BiPredicate<Villager, Holder<PoiType>> poiTypePredicate = POI_MEMORIES.get(memoryType);
+-                    if (type.isPresent() && poiTypePredicate.test(this, type.get())) {
+-                        poiManager.release(memory.pos());
+-                        poiLevel.debugSynchronizers().updatePoi(memory.pos());
+-                    }
+-                    }); // Folia - region threading
++                    // Release survives death/removal and memory changes; never read this entity on the POI owner.
++                    final VillagerData data = this.getVillagerData();
++                    final BiPredicate<VillagerData, Holder<PoiType>> predicate = POI_MEMORIES.get(memoryType);
++                    poiLevel.getPoiManager().releaseWhenLoaded(memory.pos(), type -> predicate.test(data, type), false);
+                 }
+             });
+         }
+-- 
+2.53.0.windows.1
+
