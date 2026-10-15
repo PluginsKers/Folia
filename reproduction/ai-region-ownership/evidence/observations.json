@@ -1,0 +1,165 @@
+{
+  "base": "597e41371802648e0455fc1571192ee1c83fca2b",
+  "reviewHead": "09b3c7bedac1d40ba327d490131a9a6f08d347c5",
+  "serverBuilds": {
+    "base": "597e41371802648e0455fc1571192ee1c83fca2b",
+    "version": "26.3",
+    "gradle": "9.8.0 (cached; repository wrapper unchanged at 9.8.1)",
+    "fullBuilds": true,
+    "overlayUsed": false,
+    "fixedIncludes": [
+      "profession",
+      "bed",
+      "item"
+    ],
+    "baseline": "69199b0123e1a57c7ee8b79f4de963733859ba1730df2b2f907a4badfa3287cc",
+    "fixed": "f6ff15236a15e141196e1ac5fbb8697df4fd58352138d7d9046e5bb3e65f9223"
+  },
+  "probe": {
+    "sha256": "8f0b605b96417d8ac1823dcbde19b17ac3738b535a3061df9a058415ac1bdab3",
+    "containsServerClasses": false,
+    "sameJarForAllSixRuns": true
+  },
+  "runs": {
+    "profession": {
+      "baseline": {
+        "process": {
+          "probe": "profession",
+          "exitCode": 0,
+          "timedOut": false
+        },
+        "markers": [
+          "VILLAGER_PROFESSION_REMOTE_DISTANCE_PASS",
+          "VILLAGER_PROFESSION_REGION_NATIVE_FAIL"
+        ],
+        "ownershipError": true,
+        "logSha256": "b7f989331b6e32dcd7dec0c37f41687822d9de6733962b78d291213e1e63224a"
+      },
+      "fixed": {
+        "process": {
+          "exitCode": 0,
+          "timedOut": false,
+          "probe": "profession"
+        },
+        "markers": [
+          "VILLAGER_PROFESSION_REMOTE_DISTANCE_PASS",
+          "VILLAGER_PROFESSION_DIMENSION_GUARD_PASS",
+          "VILLAGER_PROFESSION_APPROACH_RETRY_PASS",
+          "VILLAGER_PROFESSION_LOCAL_ASSIGNMENT_PASS",
+          "VILLAGER_PROFESSION_CANCELLED_EVENT_PASS",
+          "VILLAGER_PROFESSION_TIMEOUT_RELEASE_PASS",
+          "VILLAGER_PROFESSION_REGION_NATIVE_PASS"
+        ],
+        "ownershipError": false,
+        "logSha256": "46eda2554df6df457facee1313a762b4adc38f2f198607926413bcb4e256b056"
+      }
+    },
+    "bed": {
+      "baseline": {
+        "process": {
+          "probe": "bed",
+          "exitCode": 0,
+          "timedOut": false
+        },
+        "markers": [
+          "VILLAGER_JUMP_BED_LOCAL_JUMP_AND_FINISH_PASS",
+          "VILLAGER_JUMP_BED_WALK_TIMEOUT_PASS",
+          "VILLAGER_JUMP_BED_NON_BED_AND_ADULT_PASS",
+          "VILLAGER_JUMP_BED_DIMENSION_LOCAL_BED_PASS",
+          "VILLAGER_JUMP_BED_DIMENSION_NO_BED_PASS",
+          "VILLAGER_JUMP_BED_NATIVE_FAIL"
+        ],
+        "ownershipError": true,
+        "logSha256": "4b5f423db46617ce50f1c676be27fc9e20a7b61743751d9db8f6bbe10ed07922"
+      },
+      "fixed": {
+        "process": {
+          "exitCode": 0,
+          "timedOut": false,
+          "probe": "bed"
+        },
+        "markers": [
+          "VILLAGER_JUMP_BED_LOCAL_JUMP_AND_FINISH_PASS",
+          "VILLAGER_JUMP_BED_WALK_TIMEOUT_PASS",
+          "VILLAGER_JUMP_BED_NON_BED_AND_ADULT_PASS",
+          "VILLAGER_JUMP_BED_DIMENSION_LOCAL_BED_PASS",
+          "VILLAGER_JUMP_BED_DIMENSION_NO_BED_PASS",
+          "VILLAGER_JUMP_BED_UNLOADED_BOAT_STOP_PASS",
+          "VILLAGER_JUMP_BED_UNLOADED_MEMORY_STOP_PASS",
+          "VILLAGER_JUMP_BED_REMOTE_STOP_AND_RESTART_PASS",
+          "VILLAGER_JUMP_BED_NATIVE_PASS"
+        ],
+        "ownershipError": false,
+        "logSha256": "eb443e4ee1cfb3bac0eacb50bea8e9cd3446a098eb45e6dcad0bdb45f27ad626"
+      }
+    },
+    "item": {
+      "baseline": {
+        "process": {
+          "probe": "item",
+          "exitCode": 0,
+          "timedOut": false
+        },
+        "markers": [
+          "WANTED_ITEM_CASE_PASS name=ALLAY_LOCAL",
+          "WANTED_ITEM_CASE_PASS name=PIGLIN_LOCAL",
+          "WANTED_ITEM_CASE_PASS name=VILLAGER_LOCAL",
+          "WANTED_ITEM_CASE_PASS name=VILLAGER_EXISTING_WALK",
+          "WANTED_ITEM_CASE_PASS name=ALLAY_EVENT_CANCEL",
+          "WANTED_ITEM_CASE_PASS name=ALLAY_EVENT_NULL",
+          "WANTED_ITEM_CASE_PASS name=ALLAY_EVENT_NON_ITEM",
+          "WANTED_ITEM_CASE_PASS name=ALLAY_EVENT_LOCAL_REPLACEMENT",
+          "WANTED_ITEM_CASE_PASS name=ALLAY_EVENT_REMOVED_REPLACEMENT",
+          "WANTED_ITEM_CASE_PASS name=ALLAY_ORIGINAL_REMOTE_OUT_OF_RANGE",
+          "WANTED_ITEM_CASE_FAIL name=ALLAY_ORIGINAL_FOREIGN_WORLD",
+          "WANTED_ITEM_CASE_FAIL name=PIGLIN_ORIGINAL_FOREIGN_WORLD",
+          "WANTED_ITEM_CASE_FAIL name=VILLAGER_ORIGINAL_FOREIGN_WORLD",
+          "WANTED_ITEM_CASE_FAIL name=ALLAY_EVENT_REMOTE_REPLACEMENT",
+          "WANTED_ITEM_CASE_FAIL name=ALLAY_EVENT_FOREIGN_REPLACEMENT",
+          "WANTED_ITEM_CASE_FAIL name=ALLAY_EVENT_TRANSFER_ORIGINAL",
+          "WANTED_ITEM_REGION_NATIVE_FAIL"
+        ],
+        "ownershipError": true,
+        "logSha256": "9b0d67a9b0901d812e17e59b06dfbcb1050c736fdf3ad3b3799d629f3a572a71"
+      },
+      "fixed": {
+        "process": {
+          "exitCode": 0,
+          "timedOut": false,
+          "probe": "item"
+        },
+        "markers": [
+          "WANTED_ITEM_CASE_PASS name=ALLAY_LOCAL",
+          "WANTED_ITEM_CASE_PASS name=PIGLIN_LOCAL",
+          "WANTED_ITEM_CASE_PASS name=VILLAGER_LOCAL",
+          "WANTED_ITEM_CASE_PASS name=VILLAGER_EXISTING_WALK",
+          "WANTED_ITEM_CASE_PASS name=ALLAY_EVENT_CANCEL",
+          "WANTED_ITEM_CASE_PASS name=ALLAY_EVENT_NULL",
+          "WANTED_ITEM_CASE_PASS name=ALLAY_EVENT_NON_ITEM",
+          "WANTED_ITEM_CASE_PASS name=ALLAY_EVENT_LOCAL_REPLACEMENT",
+          "WANTED_ITEM_CASE_PASS name=ALLAY_EVENT_REMOVED_REPLACEMENT",
+          "WANTED_ITEM_CASE_PASS name=ALLAY_ORIGINAL_REMOTE_OUT_OF_RANGE",
+          "WANTED_ITEM_CASE_PASS name=ALLAY_ORIGINAL_FOREIGN_WORLD",
+          "WANTED_ITEM_CASE_PASS name=PIGLIN_ORIGINAL_FOREIGN_WORLD",
+          "WANTED_ITEM_CASE_PASS name=VILLAGER_ORIGINAL_FOREIGN_WORLD",
+          "WANTED_ITEM_CASE_PASS name=ALLAY_EVENT_REMOTE_REPLACEMENT",
+          "WANTED_ITEM_CASE_PASS name=ALLAY_EVENT_FOREIGN_REPLACEMENT",
+          "WANTED_ITEM_CASE_PASS name=ALLAY_EVENT_TRANSFER_ORIGINAL",
+          "WANTED_ITEM_REGION_NATIVE_PASS cases=16"
+        ],
+        "ownershipError": false,
+        "logSha256": "64bfb7b2ba73f0e6eab9d2ea0987a8aa6c6cfe75fd1c4d38b7639115f476bbc1"
+      }
+    }
+  },
+  "limits": [
+    "The fixed runtime contains all three independent guards; each fixture directly invokes its own behavior with autonomous AI disabled. Each candidate also applies independently and reproduces exactly its tested source file. Separate single-fix runtime JARs were not built.",
+    "Profession baseline stops at the foreign-dimension failure after the remote-distance control; later controls are fixed-only in this pair.",
+    "Bed baseline stops at the mounted unloaded-bed failure after five controls; later controls are fixed-only in this pair.",
+    "All sixteen item cases run on both baseline and fixed servers.",
+    "These are deterministic behavior and event reproductions on real Folia threads, not complete autonomous Brain/rideTick gameplay journeys.",
+    "Production evidence is from 26.2-7-14b7fee; the current paired run uses 26.3 base 597e413.",
+    "Startup OSHI/Perflib and SystemReport errors occur on this Windows host. They do not prevent assertions or clean shutdown.",
+    "Initial unstarted runtime downloads were stopped; the cached Mojang JAR was verified against Paperclip SHA-256 d052f14d7a173734fba553711e5b570162e2f2a313267ee31a21b975a679be64 before the formal runs."
+  ]
+}

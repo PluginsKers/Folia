@@ -1,0 +1,16 @@
+diff --git a/net/minecraft/world/entity/ai/behavior/AssignProfessionFromJobSite.java b/net/minecraft/world/entity/ai/behavior/AssignProfessionFromJobSite.java
+index bae514a553838e5e4a3d91a2713693a4847aad02..c7f68d5a0da839e3970921f045a7b17f8a5e5cf4 100644
+--- a/net/minecraft/world/entity/ai/behavior/AssignProfessionFromJobSite.java
++++ b/net/minecraft/world/entity/ai/behavior/AssignProfessionFromJobSite.java
+@@ -20,6 +20,11 @@ public class AssignProfessionFromJobSite {
+                     i,
+                     (potentialJobSite, jobSite) -> (level, body, timestamp) -> {
+                         GlobalPos pos = i.get(potentialJobSite);
++                        // Folia start - region threading
++                        if (pos.dimension() != level.dimension() || !ca.spottedleaf.moonrise.common.util.TickThread.isTickThreadFor(level, pos.pos())) {
++                            return false;
++                        }
++                        // Folia end - region threading
+                         if (!pos.pos().closerToCenterThan(body.position(), 2.0)) {
+                             return false;
+                         }

@@ -1,0 +1,20 @@
+diff --git a/net/minecraft/world/entity/ai/behavior/GoToWantedItem.java b/net/minecraft/world/entity/ai/behavior/GoToWantedItem.java
+index aff2db230f992b1cd139de0997497322f0efc419..7903a4020f190c4647bb16d73f88e41c108220db 100644
+--- a/net/minecraft/world/entity/ai/behavior/GoToWantedItem.java
++++ b/net/minecraft/world/entity/ai/behavior/GoToWantedItem.java
+@@ -33,6 +33,7 @@ public class GoToWantedItem {
+                         (lookTarget, walkTarget, wantedItem, cooldown) -> (level, body, timestamp) -> {
+                             ItemEntity item = i.get(wantedItem);
+                             if (i.tryGet(cooldown).isEmpty()
++                                && ca.spottedleaf.moonrise.common.util.TickThread.isTickThreadFor(item) // Folia - region threading
+                                 && predicate.test(body)
+                                 && item.closerThan(body, maxDistToWalk)
+                                 && body.level().getWorldBorder().isWithinBounds(item.blockPosition())
+@@ -49,6 +50,7 @@ public class GoToWantedItem {
+                                         return false; // Paper - only erase allay memory on non-item targets
+                                     }
+ 
++                                    if (!org.bukkit.Bukkit.isOwnedByCurrentRegion(targetItem)) return false; // Folia - region threading
+                                     item = targetItem.getHandle();
+                                 }
+                                 // CraftBukkit end

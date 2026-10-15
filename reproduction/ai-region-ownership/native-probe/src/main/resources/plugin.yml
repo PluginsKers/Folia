@@ -1,0 +1,5 @@
+name: FoliaAiRegionProbe
+version: '1'
+main: dev.folia.probe.FoliaAiRegionProbe
+api-version: '26.3'
+folia-supported: true
