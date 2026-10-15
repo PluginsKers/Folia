@@ -1,56 +1,43 @@
 name: Release 26.3
 
 on:
-  workflow_dispatch:
   push:
-    branches:
-      - ver/26.3.x
+    tags: ['26.3-kers.*']
 
 permissions:
   contents: read
 
 concurrency:
+  group: release-${{ github.ref }}
   cancel-in-progress: false
-  group: release-26.3
 
 jobs:
-  release:
-    # guard for manual dispatch
-    if: ${{ github.ref == 'refs/heads/ver/26.3.x' }}
-    runs-on: namespace-profile-linux-default
-    timeout-minutes: 30
-    #env:
-    #  BUILD_NUMBER: ${{ github.run_number }}
+  build:
+    uses: ./.github/workflows/build.yml
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
-      - name: "environment"
-        run: |
-          echo "BUILD_NUMBER=$GITHUB_RUN_NUMBER" >> "$GITHUB_ENV"
-          echo "BUILD_STARTED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_ENV"
-
-      - name: "git / checkout"
-        uses: namespacelabs/nscloud-checkout-action@66f2dc6f6c42a8ac6c4e53473c4840006822831e # v9.0.1
+      - uses: actions/download-artifact@v8
         with:
-          fetch-depth: 0
+          name: folia-paperclip
+          path: dist
 
-      - uses: papermc/ci/setup-gradle@main
+      - name: Verify artifact
+        working-directory: dist
+        run: sha256sum --check SHA256SUMS
 
-      - uses: papermc/ci/build-folia@main
-
-      - if: ${{ !cancelled() }}
-        uses: papermc/ci/upload-event-data@main
-        with:
-          path: ${{ github.event_path }}
-
-      - if: ${{ !cancelled() }}
-        uses: papermc/ci/upload-test-results@main
-
-      - uses: papermc/ci/publish-fill@main
-        with:
-          fill_api_url: ${{ secrets.FILL_API_URL }}
-          fill_api_key: ${{ secrets.FILL_API_KEY }}
-
-      - uses: papermc/ci/publish-maven@main
-        with:
-          maven_username: ${{ secrets.ARTIFACTORY_USERNAME }}
-          maven_password: ${{ secrets.ARTIFACTORY_PASSWORD }}
-          maven_tasks: -PpublishDevBundle :folia-api:publish publishDevBundlePublicationToPaperReleasesRepository
+      - name: Publish GitHub prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          gh release create "$GITHUB_REF_NAME"
+          dist/folia.jar dist/SHA256SUMS
+          --repo "$GITHUB_REPOSITORY"
+          --verify-tag
+          --title "Folia $GITHUB_REF_NAME"
+          --generate-notes
+          --prerelease

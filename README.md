@@ -1,3 +1,26 @@
+# PluginsKers/Folia
+
+An independently maintained Folia fork for Minecraft 26.3. The maintained branch is `kers/26.3.x`. This is an unofficial build; Folia's upstream channel for this version is ALPHA.
+
+## Builds and releases
+
+Pull requests and pushes to `kers/26.3.x` run [Patch and Build](.github/workflows/build.yml). The workflow applies patches, runs the repository build/check tasks and creates a Paperclip server. Its `folia-paperclip` artifact contains `folia.jar` and `SHA256SUMS` and is retained for 14 days. The workflow can also be started manually from GitHub Actions.
+
+After the selected changes have been reviewed and integrated, create a new immutable `26.3-kers.N` tag on the maintained branch and push it. For example:
+
+```sh
+git switch kers/26.3.x
+git pull --ff-only origin kers/26.3.x
+git tag -a 26.3-kers.1 -m "Release Folia 26.3-kers.1"
+git push origin 26.3-kers.1
+```
+
+[Release 26.3](.github/workflows/release-26.3.yaml) rebuilds the tagged commit through the same build workflow, checks that it belongs to the maintained branch, and publishes a [GitHub prerelease](https://github.com/PluginsKers/Folia/releases) with the Paperclip JAR and SHA-256 checksum. Use a new tag for each release. These workflows publish downloadable artifacts; server installation is managed separately.
+
+Read [CONTRIBUTING.md](CONTRIBUTING.md) for this fork's PR and evidence requirements.
+
+---
+
 [![Version](https://img.shields.io/maven-metadata/v?metadataUrl=https%3A%2F%2Fartifactory.papermc.io%2Fartifactory%2Funiverse%2Fdev%2Ffolia%2Ffolia-api%2Fmaven-metadata.xml&strategy=highestVersion&filter=26.3.*&label=version&color=%23344ceb
 )](https://papermc.io/downloads/folia)
 [![Folia Build Status](https://img.shields.io/github/actions/workflow/status/PaperMC/Folia/build.yml?branch=ver/26.3.x)](https://github.com/PaperMC/Folia/actions)
