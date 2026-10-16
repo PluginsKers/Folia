@@ -1,0 +1,573 @@
+From 5de4e2b7da9ad4ac287c822a1c9614699a305a2b Mon Sep 17 00:00:00 2001
+From: PluginsKers <ikers@foxmail.com>
+Date: Fri, 16 Oct 2026 09:20:45 +0800
+Subject: [PATCH] Persist player statistics asynchronously and expose bulk
+ snapshots
+
+---
+ .../threadedregions/RegionShutdownThread.java |  5 +-
+ net/minecraft/network/Connection.java         |  4 +-
+ net/minecraft/server/MinecraftServer.java     |  4 +-
+ net/minecraft/server/level/ServerPlayer.java  |  7 +-
+ .../network/ServerGamePacketListenerImpl.java |  1 +
+ .../ServerLoginPacketListenerImpl.java        | 16 +++-
+ .../network/config/PrepareSpawnTask.java      |  5 +-
+ net/minecraft/server/players/PlayerList.java  | 41 +++-----
+ net/minecraft/stats/ServerStatsCounter.java   | 55 ++++-------
+ net/minecraft/stats/StatType.java             |  6 +-
+ .../level/storage/PlayerDataStorage.java      | 96 ++-----------------
+ 11 files changed, 79 insertions(+), 161 deletions(-)
+
+diff --git a/io/papermc/paper/threadedregions/RegionShutdownThread.java b/io/papermc/paper/threadedregions/RegionShutdownThread.java
+index 865e89b..43997cc 100644
+--- a/io/papermc/paper/threadedregions/RegionShutdownThread.java
++++ b/io/papermc/paper/threadedregions/RegionShutdownThread.java
+@@ -230,7 +230,10 @@ public final class RegionShutdownThread extends ca.spottedleaf.moonrise.common.u
+         LOGGER.info("Saving all player data...");
+         MinecraftServer.getServer().getPlayerList().saveAll();
+         try {
+-            MinecraftServer.getServer().getPlayerList().playerIo.closeAsync().join();
++            java.util.concurrent.CompletableFuture.allOf(
++                MinecraftServer.getServer().getPlayerList().playerIo.closeAsync(),
++                MinecraftServer.getServer().getPlayerList().statisticIo.closeAsync()
++            ).join();
+             LOGGER.info("Saved all player data");
+         } catch (java.util.concurrent.CompletionException failure) {
+             LOGGER.error("Failed to save all player data before shutdown", failure);
+diff --git a/net/minecraft/network/Connection.java b/net/minecraft/network/Connection.java
+index 8a016a1..773fc66 100644
+--- a/net/minecraft/network/Connection.java
++++ b/net/minecraft/network/Connection.java
+@@ -77,6 +77,8 @@ public class Connection extends SimpleChannelInboundHandler<Packet<?>> {
+     private @Nullable DisconnectionDetails disconnectionDetails;
+     private final java.util.concurrent.atomic.AtomicBoolean disconnectionHandled = new java.util.concurrent.atomic.AtomicBoolean(false); // Folia - region threading - may be called concurrently during configuration stage
+     public java.util.concurrent.CompletableFuture<Void> playerDataSave = java.util.concurrent.CompletableFuture.completedFuture(null);
++    public java.util.concurrent.CompletableFuture<Void> statisticsSave = java.util.concurrent.CompletableFuture.completedFuture(null);
++    public net.minecraft.stats.@Nullable ServerStatsCounter loadedStatistics;
+     private int receivedPackets;
+     private int sentPackets;
+     private float averageReceivedPackets;
+@@ -994,7 +996,7 @@ public class Connection extends SimpleChannelInboundHandler<Packet<?>> {
+                 // Paper end - Add PlayerConnectionCloseEvent
+                 // Folia start - region threading
+                 if (packetListener instanceof net.minecraft.server.network.ServerCommonPacketListenerImpl commonPacketListener) {
+-                    this.playerDataSave.whenComplete((ignored, failure) -> net.minecraft.server.MinecraftServer.getServer().getPlayerList().removeConnection(
++                    java.util.concurrent.CompletableFuture.allOf(this.playerDataSave, this.statisticsSave).whenComplete((ignored, failure) -> net.minecraft.server.MinecraftServer.getServer().getPlayerList().removeConnection(
+                             commonPacketListener.getOwner().name(),
+                             commonPacketListener.getOwner().id(), this
+                     ));
+diff --git a/net/minecraft/server/MinecraftServer.java b/net/minecraft/server/MinecraftServer.java
+index 4091b22..c1201d6 100644
+--- a/net/minecraft/server/MinecraftServer.java
++++ b/net/minecraft/server/MinecraftServer.java
+@@ -478,7 +478,7 @@ public abstract class MinecraftServer extends ReentrantBlockableEventLoop<TickTa
+         LOGGER.warn("Performing emergency save...");
+         LOGGER.info("Saving all players...");
+         this.getPlayerList().saveAll();
+-        this.getPlayerList().playerIo.flushAsync().join();
++        java.util.concurrent.CompletableFuture.allOf(this.getPlayerList().playerIo.flushAsync(), this.getPlayerList().statisticIo.flushAsync()).join();
+         LOGGER.info("Saved all players");
+         LOGGER.info("Saving all worlds...");
+         for (final ServerLevel world : this.getAllLevels()) {
+@@ -996,7 +996,7 @@ public abstract class MinecraftServer extends ReentrantBlockableEventLoop<TickTa
+         try {
+             this.isSaving = true;
+             this.getPlayerList().saveAll(); // Paper - Incremental chunk and player saving; diff on change
+-            if (flush) this.getPlayerList().playerIo.flushAsync().join();
++            if (flush) java.util.concurrent.CompletableFuture.allOf(this.getPlayerList().playerIo.flushAsync(), this.getPlayerList().statisticIo.flushAsync()).join();
+             boolean result = this.saveAllChunks(silent, flush, force);
+             this.warnOnLowDiskSpace();
+             return result;
+diff --git a/net/minecraft/server/level/ServerPlayer.java b/net/minecraft/server/level/ServerPlayer.java
+index 6bb34d1..c047268 100644
+--- a/net/minecraft/server/level/ServerPlayer.java
++++ b/net/minecraft/server/level/ServerPlayer.java
+@@ -478,13 +478,18 @@ public class ServerPlayer extends Player implements ca.spottedleaf.moonrise.patc
+     // Paper end - rewrite chunk system
+ 
+     public ServerPlayer(final MinecraftServer server, final ServerLevel level, final GameProfile gameProfile, final ClientInformation clientInformation) {
++        this(server, level, gameProfile, clientInformation, server.getPlayerList().getPlayerStats(gameProfile));
++    }
++
++    public ServerPlayer(final MinecraftServer server, final ServerLevel level, final GameProfile gameProfile,
++                        final ClientInformation clientInformation, final ServerStatsCounter stats) {
+         super(level, gameProfile);
+         this.server = server;
+         this.textFilter = server.createTextFilterForPlayer(this);
+         this.gameMode = server.createGameModeForPlayer(this);
+         this.gameMode.setGameModeForPlayer(this.calculateGameModeForNewPlayer(null), null);
+         this.recipeBook = new ServerRecipeBook((id, output) -> server.getRecipeManager().listDisplaysForRecipe(id, output));
+-        this.stats = server.getPlayerList().getPlayerStats(this);
++        this.stats = java.util.Objects.requireNonNull(stats);
+         this.advancements = server.getPlayerList().getPlayerAdvancements(this);
+         this.updateOptionsNoEvents(clientInformation); // Paper - don't call options events on login
+         this.object = null;
+diff --git a/net/minecraft/server/network/ServerGamePacketListenerImpl.java b/net/minecraft/server/network/ServerGamePacketListenerImpl.java
+index 35c1a7a..2010def 100644
+--- a/net/minecraft/server/network/ServerGamePacketListenerImpl.java
++++ b/net/minecraft/server/network/ServerGamePacketListenerImpl.java
+@@ -2950,6 +2950,7 @@ public class ServerGamePacketListenerImpl
+         try { // Folia - rewrite login process - move connection ownership to global region
+             this.hackSwitchingConfig = true; // Folia - rewrite login process - avoid adding logout ticket here
+         this.removePlayerFromWorld();
++        this.connection.loadedStatistics = this.player.getStats(); // Preserve the current session across configuration.
+         } finally { // Folia start - rewrite login process - move connection ownership to global region
+             io.papermc.paper.threadedregions.RegionizedWorldData worldData = this.player.level().getCurrentWorldData();
+             worldData.removeConnection(this.player);
+diff --git a/net/minecraft/server/network/ServerLoginPacketListenerImpl.java b/net/minecraft/server/network/ServerLoginPacketListenerImpl.java
+index 7a8a41c..a0ed3fe 100644
+--- a/net/minecraft/server/network/ServerLoginPacketListenerImpl.java
++++ b/net/minecraft/server/network/ServerLoginPacketListenerImpl.java
+@@ -62,6 +62,7 @@ public class ServerLoginPacketListenerImpl implements ServerLoginPacketListener,
+     private final ServerActivityMonitor serverActivityMonitor;
+     public volatile ServerLoginPacketListenerImpl.State state = ServerLoginPacketListenerImpl.State.HELLO;
+     private int tick;
++    private java.util.concurrent.@Nullable CompletableFuture<net.minecraft.stats.ServerStatsCounter> pendingStatistics;
+     public @Nullable String requestedUsername; // Paper - public
+     public @Nullable GameProfile authenticatedProfile;
+     private final String serverId = "";
+@@ -94,9 +95,20 @@ public class ServerLoginPacketListenerImpl implements ServerLoginPacketListener,
+             // Folia start - region threading - rewrite login process
+             String name = this.authenticatedProfile.name();
+             java.util.UUID uniqueId = this.authenticatedProfile.id();
+-            if (this.server.getPlayerList().pushPendingJoin(name, uniqueId, this.connection)) {
++            if (this.pendingStatistics != null || this.server.getPlayerList().pushPendingJoin(name, uniqueId, this.connection)) {
+             // Folia end - region threading - rewrite login process
+-            this.verifyLoginAndFinishConnectionSetup(Objects.requireNonNull(this.authenticatedProfile));
++                if (this.pendingStatistics == null) {
++                    this.pendingStatistics = this.server.getPlayerList().getPlayerStatsAsync(this.authenticatedProfile, true);
++                }
++                if (this.pendingStatistics.isDone() && this.connection.isConnected()) {
++                    try {
++                        this.connection.loadedStatistics = this.pendingStatistics.join();
++                        this.verifyLoginAndFinishConnectionSetup(Objects.requireNonNull(this.authenticatedProfile));
++                    } catch (Exception failure) {
++                        LOGGER.error("Couldn't load player statistics", failure);
++                        this.disconnectAsync(Component.translatable("multiplayer.disconnect.invalid_player_data"));
++                    }
++                }
+             } else { --this.tick; } // Folia - region threading - rewrite login process // Folia - max concurrent logins
+         }
+ 
+diff --git a/net/minecraft/server/network/config/PrepareSpawnTask.java b/net/minecraft/server/network/config/PrepareSpawnTask.java
+index 4cdbbeb..7ff84ca 100644
+--- a/net/minecraft/server/network/config/PrepareSpawnTask.java
++++ b/net/minecraft/server/network/config/PrepareSpawnTask.java
+@@ -257,7 +257,8 @@ public class PrepareSpawnTask implements ConfigurationTask {
+                             PrepareSpawnTask.this.server,
+                             PrepareSpawnTask.this.server.overworld(),
+                             PrepareSpawnTask.this.profile,
+-                            net.minecraft.server.level.ClientInformation.createDefault()
++                            net.minecraft.server.level.ClientInformation.createDefault(),
++                            java.util.Objects.requireNonNull(PrepareSpawnTask.this.listener.connection.loadedStatistics)
+                         );
+                         PrepareSpawnTask.this.listener.connection.savedPlayerForLegacyEvents = player;
+                     }
+@@ -352,7 +353,7 @@ public class PrepareSpawnTask implements ConfigurationTask {
+                 player.updateOptionsNoEvents(cookie.clientInformation());
+                 player.setServerLevel(this.spawnLevel);
+             } else {
+-                player = new ServerPlayer(PrepareSpawnTask.this.server, this.spawnLevel, cookie.gameProfile(), cookie.clientInformation());
++                player = new ServerPlayer(PrepareSpawnTask.this.server, this.spawnLevel, cookie.gameProfile(), cookie.clientInformation(), java.util.Objects.requireNonNull(connection.loadedStatistics));
+             }
+             // Paper end - configuration api - possibly use legacy saved server player instance
+             PrepareSpawnTask.this.listener.paperConnection.applyPendingEntityId(player); // Paper - internal entity id api - possibly override player network id if plugins used internal API to configure it.
+diff --git a/net/minecraft/server/players/PlayerList.java b/net/minecraft/server/players/PlayerList.java
+index 9f4db49..04a84d8 100644
+--- a/net/minecraft/server/players/PlayerList.java
++++ b/net/minecraft/server/players/PlayerList.java
+@@ -127,6 +127,7 @@ public abstract class PlayerList {
+     // private final Map<UUID, PlayerAdvancements> advancements = Maps.newHashMap();
+     // CraftBukkit end
+     public final PlayerDataStorage playerIo;
++    public final io.papermc.paper.storage.PlayerStatisticsStorage statisticIo;
+     private final LayeredRegistryAccess<RegistryLayer> registries;
+     private int viewDistance;
+     private int simulationDistance;
+@@ -214,6 +215,7 @@ public abstract class PlayerList {
+         this.server = server;
+         this.registries = registries;
+         this.playerIo = playerIo;
++        this.statisticIo = new io.papermc.paper.storage.PlayerStatisticsStorage(server.getWorldPath(LevelResource.PLAYER_STATS_DIR), net.minecraft.util.Util.ioPool());
+         this.whitelist = new UserWhiteList(WHITELIST_FILE, notificationService);
+         this.ops = new ServerOpList(OPLIST_FILE, notificationService);
+         this.bans = new UserBanList(USERBANLIST_FILE, notificationService);
+@@ -500,7 +502,12 @@ public abstract class PlayerList {
+         }
+         ServerStatsCounter stats = player.getStats(); // CraftBukkit
+         if (stats != null) {
+-            stats.save();
++            java.util.concurrent.CompletableFuture<Void> saved = stats.saveAsync();
++            player.connection.connection.statisticsSave = saved;
++            final UUID id = player.getUUID();
++            saved.whenComplete((ignored, failure) -> {
++                if (failure != null) LOGGER.error("Failed to save statistics for {}", id, failure);
++            });
+         }
+ 
+         PlayerAdvancements advancements = player.getAdvancements(); // CraftBukkit
+@@ -1059,7 +1066,7 @@ public abstract class PlayerList {
+             if (!ca.spottedleaf.moonrise.common.util.TickThread.isTickThreadFor(player)) {
+                 continue;
+             }
+-            if (interval != -1 && !player.connection.connection.playerDataSave.isDone()) {
++            if (interval != -1 && (!player.connection.connection.playerDataSave.isDone() || !player.connection.connection.statisticsSave.isDone())) {
+                 continue;
+             }
+             // Folia end - region threading
+@@ -1289,34 +1296,14 @@ public abstract class PlayerList {
+         }
+     }
+     public ServerStatsCounter getPlayerStats(final GameProfile gameProfile) {
+-            Path targetFile = this.locateStatsFile(gameProfile);
+-            return new ServerStatsCounter(this.server, targetFile);
++        return this.getPlayerStatsAsync(gameProfile, true).join();
+     }
+-    // CraftBukkit end
+ 
+-    private Path locateStatsFile(final GameProfile gameProfile) {
+-        Path statFolder = this.server.getWorldPath(LevelResource.PLAYER_STATS_DIR);
+-        Path uuidStatsFile = statFolder.resolve(gameProfile.id() + ".json");
+-        if (Files.exists(uuidStatsFile)) {
+-            return uuidStatsFile;
+-        }
+-
+-        String playerNameStatsFile = gameProfile.name() + ".json";
+-        if (FileUtil.isValidPathSegment(playerNameStatsFile)) {
+-            Path playerNameStatsPath = statFolder.resolve(playerNameStatsFile);
+-            if (Files.isRegularFile(playerNameStatsPath)) {
+-                try {
+-                    return Files.move(playerNameStatsPath, uuidStatsFile);
+-                } catch (IOException e) {
+-                    LOGGER.warn("Failed to copy file {} to {}", playerNameStatsFile, uuidStatsFile);
+-                    return playerNameStatsPath;
+-                }
+-            }
+-        }
+-
+-        return uuidStatsFile;
++    public java.util.concurrent.CompletableFuture<ServerStatsCounter> getPlayerStatsAsync(final GameProfile profile, final boolean migrate) {
++        return this.statisticIo.readAsync(profile, migrate).thenApplyAsync(
++            data -> new ServerStatsCounter(this.server, profile.id(), this.statisticIo, data), net.minecraft.util.Util.ioPool());
+     }
+-
++    // CraftBukkit end
+     public PlayerAdvancements getPlayerAdvancements(final ServerPlayer player) {
+         UUID uuid = player.getUUID();
+         PlayerAdvancements result = player.getAdvancements(); // CraftBukkit
+diff --git a/net/minecraft/stats/ServerStatsCounter.java b/net/minecraft/stats/ServerStatsCounter.java
+index f5beb00..9a46246 100644
+--- a/net/minecraft/stats/ServerStatsCounter.java
++++ b/net/minecraft/stats/ServerStatsCounter.java
+@@ -1,12 +1,8 @@
+ package net.minecraft.stats;
+ 
+ import com.google.common.collect.Sets;
+-import com.google.gson.Gson;
+-import com.google.gson.GsonBuilder;
+ import com.google.gson.JsonElement;
+-import com.google.gson.JsonIOException;
+ import com.google.gson.JsonObject;
+-import com.google.gson.JsonParseException;
+ import com.mojang.datafixers.DataFixer;
+ import com.mojang.logging.LogUtils;
+ import com.mojang.serialization.Codec;
+@@ -15,12 +11,6 @@ import com.mojang.serialization.Dynamic;
+ import com.mojang.serialization.JsonOps;
+ import it.unimi.dsi.fastutil.objects.Object2IntMap;
+ import it.unimi.dsi.fastutil.objects.Object2IntOpenHashMap;
+-import java.io.IOException;
+-import java.io.Reader;
+-import java.io.Writer;
+-import java.nio.charset.StandardCharsets;
+-import java.nio.file.Files;
+-import java.nio.file.Path;
+ import java.util.HashMap;
+ import java.util.Map;
+ import java.util.Set;
+@@ -31,15 +21,12 @@ import net.minecraft.nbt.NbtUtils;
+ import net.minecraft.network.protocol.game.ClientboundAwardStatsPacket;
+ import net.minecraft.server.MinecraftServer;
+ import net.minecraft.server.level.ServerPlayer;
+-import net.minecraft.util.FileUtil;
+-import net.minecraft.util.StrictJsonParser;
+ import net.minecraft.util.Util;
+ import net.minecraft.util.datafix.DataFixTypes;
+ import net.minecraft.world.entity.player.Player;
+ import org.slf4j.Logger;
+ 
+ public class ServerStatsCounter extends StatsCounter {
+-    private static final Gson GSON = new GsonBuilder().setPrettyPrinting().create();
+     private static final Logger LOGGER = LogUtils.getLogger();
+     private static final Codec<Map<Stat<?>, Integer>> STATS_CODEC = Codec.dispatchedMap(
+             BuiltInRegistries.STAT_TYPE.byNameCodec(), Util.memoize(ServerStatsCounter::createTypedStatsCodec)
+@@ -49,7 +36,8 @@ public class ServerStatsCounter extends StatsCounter {
+             groupedStats.forEach((type, values) -> stats.putAll((Map<? extends Stat<?>, ? extends Integer>)values));
+             return stats;
+         }, map -> map.entrySet().stream().collect(Collectors.groupingBy(entry -> entry.getKey().getType(), Util.toMap())));
+-    private final Path file;
++    private final java.util.UUID id;
++    private final io.papermc.paper.storage.PlayerStatisticsStorage storage;
+     private final Set<Stat<?>> dirty = Sets.newHashSet();
+ 
+     private static <T> Codec<Map<Stat<?>, Integer>> createTypedStatsCodec(final StatType<T> type) {
+@@ -63,18 +51,12 @@ public class ServerStatsCounter extends StatsCounter {
+         return Codec.unboundedMap(statCodec, Codec.INT);
+     }
+ 
+-    public ServerStatsCounter(final MinecraftServer server, final Path file) {
+-        this.file = file;
+-        if (Files.isRegularFile(file)) {
+-            try (Reader reader = Files.newBufferedReader(file, StandardCharsets.UTF_8)) {
+-                JsonElement element = StrictJsonParser.parse(reader);
+-                this.parse(server.getFixerUpper(), element);
+-            } catch (IOException e) {
+-                LOGGER.error("Couldn't read statistics file {}", file, e);
+-            } catch (JsonParseException e) {
+-                LOGGER.error("Couldn't parse statistics file {}", file, e);
+-            }
+-        }
++    public ServerStatsCounter(final MinecraftServer server, final java.util.UUID id,
++                              final io.papermc.paper.storage.PlayerStatisticsStorage storage,
++                              final java.util.Optional<JsonElement> data) {
++        this.id = id;
++        this.storage = storage;
++        data.ifPresent(element -> this.parse(server.getFixerUpper(), element));
+         // Paper start - Moved after stat fetching for player state file
+         // Moves the loading after vanilla loading, so it overrides the values.
+         // Disables saving any forced stats, so it stays at the same value (without enabling disableStatSaving)
+@@ -89,18 +71,21 @@ public class ServerStatsCounter extends StatsCounter {
+     }
+ 
+     public void save() {
+-        if (org.spigotmc.SpigotConfig.disableStatSaving) return; // Spigot
+         try {
+-            FileUtil.createDirectoriesSafe(this.file.getParent());
+-
+-            try (Writer writer = Files.newBufferedWriter(this.file, StandardCharsets.UTF_8)) {
+-                GSON.toJson(this.toJson(), GSON.newJsonWriter(writer));
+-            }
+-        } catch (IOException | JsonIOException e) {
+-            LOGGER.error("Couldn't save stats to {}", this.file, e);
++            this.saveAsync().join();
++        } catch (java.util.concurrent.CompletionException failure) {
++            LOGGER.error("Couldn't save statistics for {}", this.id, failure);
+         }
+     }
+ 
++    public java.util.concurrent.CompletableFuture<Void> saveAsync() {
++        if (org.spigotmc.SpigotConfig.disableStatSaving) return java.util.concurrent.CompletableFuture.completedFuture(null);
++        try {
++            return this.storage.saveAsync(this.id, this.toJson());
++        } catch (Exception failure) {
++            return this.storage.failedSave(this.id, failure);
++        }
++    }
+     @Override
+     public void setValue(final Player player, final Stat<?> stat, final int count) {
+         if (org.spigotmc.SpigotConfig.disableStatSaving) return; // Spigot
+@@ -121,7 +106,7 @@ public class ServerStatsCounter extends StatsCounter {
+         this.stats
+             .putAll(
+                 STATS_CODEC.parse(data.get("stats").orElseEmptyMap())
+-                    .resultOrPartial(error -> LOGGER.error("Failed to parse statistics for {}: {}", this.file, error))
++                    .resultOrPartial(error -> LOGGER.error("Couldn't parse statistics for {}: {}", this.id, error))
+                     .orElse(Map.of())
+             );
+     }
+diff --git a/net/minecraft/stats/StatType.java b/net/minecraft/stats/StatType.java
+index 3c1d74c..fdf556a 100644
+--- a/net/minecraft/stats/StatType.java
++++ b/net/minecraft/stats/StatType.java
+@@ -11,7 +11,7 @@ import net.minecraft.network.codec.StreamCodec;
+ 
+ public class StatType<T> implements Iterable<Stat<T>> {
+     private final Registry<T> registry;
+-    private final Map<T, Stat<T>> map = new IdentityHashMap<>();
++    private final Map<T, Stat<T>> map = java.util.Collections.synchronizedMap(new IdentityHashMap<>());
+     private final Component displayName;
+     private final StreamCodec<RegistryFriendlyByteBuf, Stat<T>> streamCodec;
+ 
+@@ -39,7 +39,9 @@ public class StatType<T> implements Iterable<Stat<T>> {
+ 
+     @Override
+     public Iterator<Stat<T>> iterator() {
+-        return this.map.values().iterator();
++        synchronized (this.map) {
++            return java.util.List.copyOf(this.map.values()).iterator();
++        }
+     }
+ 
+     public Stat<T> get(final T argument) {
+diff --git a/net/minecraft/world/level/storage/PlayerDataStorage.java b/net/minecraft/world/level/storage/PlayerDataStorage.java
+index 124bad7..a9183d3 100644
+--- a/net/minecraft/world/level/storage/PlayerDataStorage.java
++++ b/net/minecraft/world/level/storage/PlayerDataStorage.java
+@@ -9,15 +9,11 @@ import java.nio.file.Path;
+ import java.nio.file.StandardCopyOption;
+ import java.time.ZonedDateTime;
+ import java.util.Optional;
+-import java.util.HashMap;
+ import java.util.List;
+-import java.util.Map;
+ import java.util.UUID;
+-import java.util.concurrent.Callable;
+ import java.util.concurrent.CompletableFuture;
+ import java.util.concurrent.CompletionException;
+ import java.util.concurrent.Executor;
+-import java.util.concurrent.RejectedExecutionException;
+ import net.minecraft.nbt.CompoundTag;
+ import net.minecraft.nbt.NbtAccounter;
+ import net.minecraft.nbt.NbtIo;
+@@ -28,15 +24,12 @@ import net.minecraft.util.Util;
+ import net.minecraft.util.datafix.DataFixTypes;
+ import net.minecraft.world.entity.player.Player;
+ import org.slf4j.Logger;
+-import org.jspecify.annotations.Nullable;
+ 
+ public class PlayerDataStorage {
+     private static final Logger LOGGER = LogUtils.getLogger();
+     private final File playerDir;
+     protected final DataFixer fixerUpper;
+-    private final Executor executor;
+-    private final Map<UUID, PendingData> pending = new HashMap<>();
+-    private boolean closed;
++    private final io.papermc.paper.storage.OrderedIo<UUID> io;
+ 
+     public PlayerDataStorage(final LevelStorageSource.LevelStorageAccess levelAccess, final DataFixer fixerUpper) {
+         this(levelAccess.getLevelPath(LevelResource.PLAYER_DATA_DIR), fixerUpper, Util.ioPool());
+@@ -45,7 +38,7 @@ public class PlayerDataStorage {
+     PlayerDataStorage(final Path playerDir, final DataFixer fixerUpper, final Executor executor) {
+         this.fixerUpper = fixerUpper;
+         this.playerDir = playerDir.toFile();
+-        this.executor = executor;
++        this.io = new io.papermc.paper.storage.OrderedIo<>(executor);
+         this.playerDir.mkdirs();
+     }
+ 
+@@ -71,13 +64,13 @@ public class PlayerDataStorage {
+             }
+             return this.saveSnapshotAsync(player.getUUID(), output.buildResult());
+         } catch (Exception failure) {
+-            return this.enqueue(player.getUUID(), List.of(player.getUUID()), true, () -> { throw failure; });
++            return this.io.submit(List.of(player.getUUID()), true, () -> { throw failure; });
+         }
+     }
+ 
+     CompletableFuture<Void> saveSnapshotAsync(final UUID id, final CompoundTag data) {
+         CompoundTag snapshot = data.copy();
+-        return this.enqueue(id, List.of(id), true, () -> {
++        return this.io.submit(List.of(id), true, () -> {
+             Path directory = this.playerDir.toPath();
+             Path temporary = Files.createTempFile(directory, id + "-", ".dat");
+             try {
+@@ -97,7 +90,7 @@ public class PlayerDataStorage {
+     }
+ 
+     public CompletableFuture<Optional<CompoundTag>> readCurrentAsync(final UUID id) {
+-        return this.enqueue(id, List.of(id), false, () -> {
++        return this.io.submit(List.of(id), false, () -> {
+             Path current = this.playerDir.toPath().resolve(id + ".dat");
+             return Files.notExists(current) ? Optional.empty() : Optional.of(NbtIo.readCompressed(current, NbtAccounter.unlimitedHeap()));
+         });
+@@ -132,7 +125,7 @@ public class PlayerDataStorage {
+     CompletableFuture<LoadedData> loadWithMetadataAsync(final NameAndId nameAndId, final boolean onlineMode) {
+         UUID offlineId = net.minecraft.core.UUIDUtil.createOfflinePlayerUUID(nameAndId.name());
+         List<UUID> ids = onlineMode && !offlineId.equals(nameAndId.id()) ? List.of(nameAndId.id(), offlineId) : List.of(nameAndId.id());
+-        return this.enqueue(nameAndId.id(), ids, false, () -> this.loadWithFallback(nameAndId, onlineMode));
++        return this.io.submit(ids, false, () -> this.loadWithFallback(nameAndId, onlineMode));
+     }
+ 
+     private LoadedData loadWithFallback(final NameAndId nameAndId, final boolean onlineMode) throws IOException {
+@@ -198,89 +191,16 @@ public class PlayerDataStorage {
+         return new LoadedData(Optional.of(data), modified);
+     }
+ 
+-    private <T> CompletableFuture<T> enqueue(final UUID id, final List<UUID> ids, final boolean write, final Callable<T> action) {
+-        final List<PendingData> states;
+-        final CompletableFuture<Void> previous;
+-        final CompletableFuture<Void> finished = new CompletableFuture<>();
+-        synchronized (this.pending) {
+-            if (this.closed) return CompletableFuture.failedFuture(new RejectedExecutionException("Player data storage is closed"));
+-            states = ids.stream().map(key -> this.pending.computeIfAbsent(key, ignored -> new PendingData())).toList();
+-            previous = CompletableFuture.allOf(states.stream().map(state -> state.tail).toArray(CompletableFuture[]::new));
+-            states.forEach(state -> state.tail = finished);
+-        }
+-
+-        CompletableFuture<T> result = new CompletableFuture<>();
+-        CompletableFuture<T> operation;
+-        try {
+-            operation = previous.thenApplyAsync(ignored -> {
+-                if (!write) {
+-                    synchronized (this.pending) {
+-                        for (PendingData state : states) {
+-                            if (state.failure != null) throw new CompletionException("Previous player save failed for " + id, state.failure);
+-                        }
+-                    }
+-                }
+-                try {
+-                    return action.call();
+-                } catch (Exception failure) {
+-                    throw new CompletionException(failure);
+-                }
+-            }, this.executor);
+-        } catch (RuntimeException failure) {
+-            operation = CompletableFuture.failedFuture(failure);
+-        }
+-        operation.whenComplete((value, failure) -> {
+-            synchronized (this.pending) {
+-                if (write) states.getFirst().failure = failure;
+-            }
+-            // Release the storage queue before invoking caller continuations.
+-            finished.complete(null);
+-            synchronized (this.pending) {
+-                for (int index = 0; index < ids.size(); index++) {
+-                    PendingData state = states.get(index);
+-                    if (state.tail == finished && state.failure == null) this.pending.remove(ids.get(index), state);
+-                }
+-            }
+-            if (failure == null) result.complete(value);
+-            else result.completeExceptionally(failure);
+-        });
+-        // The internal completion must survive cancellation of a caller's future.
+-        return result.copy();
+-    }
+-
+     public CompletableFuture<Void> flushAsync() {
+-        synchronized (this.pending) {
+-            return CompletableFuture.allOf(List.copyOf(this.pending.keySet()).stream()
+-                .map(id -> this.enqueue(id, List.of(id), false, () -> null))
+-                .toArray(CompletableFuture[]::new));
+-        }
++        return this.io.flushAsync();
+     }
+ 
+     public CompletableFuture<Void> closeAsync() {
+-        final List<PendingData> states;
+-        final CompletableFuture<Void> drained;
+-        synchronized (this.pending) {
+-            this.closed = true;
+-            states = List.copyOf(this.pending.values());
+-            drained = CompletableFuture.allOf(states.stream().map(state -> state.tail).toArray(CompletableFuture[]::new));
+-        }
+-        return drained.thenRun(() -> {
+-            synchronized (this.pending) {
+-                for (PendingData state : states) {
+-                    if (state.failure != null) throw new CompletionException("Failed to save all player data before closing", state.failure);
+-                }
+-            }
+-        });
++        return this.io.closeAsync();
+     }
+-
+     public record LoadedData(Optional<CompoundTag> data, long modified) {
+     }
+ 
+-    private static final class PendingData {
+-        CompletableFuture<Void> tail = CompletableFuture.completedFuture(null);
+-        @Nullable Throwable failure;
+-    }
+-
+     // CraftBukkit start
+     public File getPlayerDir() {
+         return this.playerDir;
