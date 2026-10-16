@@ -1,0 +1,1070 @@
+From 8c00aee2425c8fe6a0df50275190d7d644dfa3f9 Mon Sep 17 00:00:00 2001
+From: PluginsKers <ikers@foxmail.com>
+Date: Wed, 14 Oct 2026 20:00:44 +0800
+Subject: [PATCH] fix: continue villager POI searches with loading leases
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+---
+ .../scheduling/ChunkHolderManager.java        |  65 ++
+ .../patches/poi_lookup/PoiAccess.java         | 578 +++++++++---------
+ .../patches/poi_lookup/PoiSearchTask.java     | 119 ++++
+ .../world/entity/ai/behavior/AcquirePoi.java  |  62 +-
+ .../behavior/SetClosestHomeAsWalkTarget.java  |  64 +-
+ 5 files changed, 533 insertions(+), 355 deletions(-)
+ create mode 100644 ca/spottedleaf/moonrise/patches/poi_lookup/PoiSearchTask.java
+
+diff --git a/ca/spottedleaf/moonrise/patches/chunk_system/scheduling/ChunkHolderManager.java b/ca/spottedleaf/moonrise/patches/chunk_system/scheduling/ChunkHolderManager.java
+index 8b06d0c893e07c969d35c4d7528927552c27b48b..ae378ccbeb77a312d241c5defe77fe12553de063 100644
+--- a/ca/spottedleaf/moonrise/patches/chunk_system/scheduling/ChunkHolderManager.java
++++ b/ca/spottedleaf/moonrise/patches/chunk_system/scheduling/ChunkHolderManager.java
+@@ -1173,6 +1173,71 @@ public final class ChunkHolderManager {
+         return null;
+     }
+ 
++    public PoiChunkLease acquirePoiChunk(final int chunkX, final int chunkZ) {
++        final PoiChunkLease lease = new PoiChunkLease(chunkX, chunkZ);
++        try {
++            final ReentrantAreaLock.Node ticketLock = this.ticketLockArea.lock(chunkX, chunkZ);
++            try {
++                this.addTicketAtLevel(ChunkTaskScheduler.POI_LOAD, chunkX, chunkZ, MAX_TICKET_LEVEL, lease.id);
++                final ReentrantAreaLock.Node schedulingLock = this.taskScheduler.schedulingLockArea.lock(chunkX, chunkZ);
++                try {
++                    final NewChunkHolder holder = this.getOrCreateChunkHolder(chunkX, chunkZ);
++                    final PoiChunk loaded = holder.getPoiChunk();
++                    if (loaded != null) {
++                        lease.ready.complete(loaded);
++                    } else {
++                        lease.task = holder.getOrLoadPoiData(result -> {
++                            if (result.right() != null) lease.ready.completeExceptionally(result.right());
++                            else lease.ready.complete(result.left());
++                        });
++                    }
++                } finally {
++                    this.taskScheduler.schedulingLockArea.unlock(schedulingLock);
++                }
++            } finally {
++                this.ticketLockArea.unlock(ticketLock);
++            }
++            if (lease.task != null) lease.task.schedule();
++            return lease;
++        } catch (final Throwable failure) {
++            try {
++                lease.close();
++            } catch (final Throwable cleanupFailure) {
++                failure.addSuppressed(cleanupFailure);
++            }
++            throw failure;
++        }
++    }
++
++    public final class PoiChunkLease implements AutoCloseable {
++        private final int chunkX, chunkZ;
++        private final Long id = ChunkTaskScheduler.getNextPoiLoadId();
++        private final AtomicBoolean closed = new AtomicBoolean();
++        private final java.util.concurrent.CompletableFuture<PoiChunk> ready = new java.util.concurrent.CompletableFuture<>();
++        private NewChunkHolder.GenericDataLoadTaskCallback task;
++
++        private PoiChunkLease(final int chunkX, final int chunkZ) {
++            this.chunkX = chunkX;
++            this.chunkZ = chunkZ;
++        }
++
++        // Loading the result into the world and accessing its sections still require the owning region.
++        public PoiChunk getIfReady() {
++            if (this.closed.get()) throw new IllegalStateException("POI lease is closed");
++            return this.ready.getNow(null);
++        }
++
++        @Override
++        public void close() {
++            if (!this.closed.compareAndSet(false, true)) return;
++            try {
++                if (this.task != null) this.task.cancel();
++            } finally {
++                ChunkHolderManager.this.removeTicketAtLevel(ChunkTaskScheduler.POI_LOAD, this.chunkX, this.chunkZ, MAX_TICKET_LEVEL, this.id);
++            }
++        }
++    }
++
+     public PoiChunk loadPoiChunk(final int chunkX, final int chunkZ) {
+         TickThread.ensureTickThread(this.world, chunkX, chunkZ, "Cannot create poi chunk off-main");
+         PoiChunk ret;
+diff --git a/ca/spottedleaf/moonrise/patches/poi_lookup/PoiAccess.java b/ca/spottedleaf/moonrise/patches/poi_lookup/PoiAccess.java
+index 85d80b3952a76b0ca7f67401a659cf35dd55b082..8a49923fffe08c026e3ee4981ca1d0c09e08372e 100644
+--- a/ca/spottedleaf/moonrise/patches/poi_lookup/PoiAccess.java
++++ b/ca/spottedleaf/moonrise/patches/poi_lookup/PoiAccess.java
+@@ -341,215 +341,262 @@ public final class PoiAccess {
+                                              final boolean load,
+                                              final int max,
+                                              final List<PoiRecord> ret) {
+-        final Predicate<? super PoiRecord> occupancyFilter = occupancy.getTest();
+-
+-        final Double2ObjectRBTreeMap<List<PoiRecord>> closestRecords = new Double2ObjectRBTreeMap<>();
+-        int totalRecords = 0;
+-        double furthestDistanceSquared = maxDistanceSquared;
+-
+-        final int lowerX = Mth.floor(sourcePosition.getX() - range) >> 4;
+-        final int lowerY = WorldUtil.getMinSection(poiStorage.levelHeightAccessor);
+-        final int lowerZ = Mth.floor(sourcePosition.getZ() - range) >> 4;
+-        final int upperX = Mth.floor(sourcePosition.getX() + range) >> 4;
+-        final int upperY = WorldUtil.getMaxSection(poiStorage.levelHeightAccessor);
+-        final int upperZ = Mth.floor(sourcePosition.getZ() + range) >> 4;
+-
+-        final int centerX = sourcePosition.getX() >> 4;
+-        final int centerY = Mth.clamp(sourcePosition.getY() >> 4, lowerY, upperY);
+-        final int centerZ = sourcePosition.getZ() >> 4;
+-        final long centerKey = CoordinateUtils.getChunkSectionKey(centerX, centerY, centerZ);
++        final Search search = new NearestSearch(poiStorage, villagePlaceType, positionPredicate, sourcePosition, range, maxDistanceSquared, occupancy, max);
++        search.advance(key -> load ? poiStorage.getOrLoad(key) : java.util.Objects.requireNonNullElse(poiStorage.get(key), Optional.empty()));
++        ret.addAll(search.result());
++    }
+ 
+-        final LongArrayFIFOQueue queue = new LongArrayFIFOQueue();
+-        final LongOpenHashSet seen = new LongOpenHashSet();
+-        seen.add(centerKey);
+-        queue.enqueue(centerKey);
++    public interface Search {
++        // A null section means pending; Optional.empty means a successfully loaded empty section.
++        boolean advance(java.util.function.LongFunction<Optional<PoiSection>> sections);
++        List<PoiRecord> result();
++    }
+ 
+-        while (!queue.isEmpty()) {
+-            final long key = queue.dequeueLong();
+-            final int sectionX = CoordinateUtils.getChunkSectionX(key);
+-            final int sectionY = CoordinateUtils.getChunkSectionY(key);
+-            final int sectionZ = CoordinateUtils.getChunkSectionZ(key);
++    public static final class NearestSearch implements Search {
++        private final Predicate<Holder<PoiType>> villagePlaceType;
++        private final Predicate<BlockPos> positionPredicate;
++        private final BlockPos sourcePosition;
++        private final int range, max;
++        private final double maxDistanceSquared;
++        private final Predicate<? super PoiRecord> occupancyFilter;
++        private final Double2ObjectRBTreeMap<List<PoiRecord>> closestRecords = new Double2ObjectRBTreeMap<>();
++        private int totalRecords;
++        private double furthestDistanceSquared;
++        private final int lowerX, lowerY, lowerZ, upperX, upperY, upperZ;
++        private final LongArrayFIFOQueue queue = new LongArrayFIFOQueue();
++        private final LongOpenHashSet seen = new LongOpenHashSet();
++        private final List<PoiRecord> ret = new ArrayList<>();
++        private boolean finished;
++        public NearestSearch(final PoiManager poiStorage, final Predicate<Holder<PoiType>> villagePlaceType,
++                             final Predicate<BlockPos> positionPredicate, final BlockPos sourcePosition,
++                             final int range, final double maxDistanceSquared, final PoiManager.Occupancy occupancy, final int max) {
++            this.villagePlaceType = villagePlaceType;
++            this.positionPredicate = positionPredicate;
++            this.sourcePosition = sourcePosition.immutable();
++            this.range = range;
++            this.max = max;
++            this.maxDistanceSquared = maxDistanceSquared;
++            this.occupancyFilter = occupancy.getTest();
++
++            this.furthestDistanceSquared = maxDistanceSquared;
++
++            this.lowerX = Mth.floor(sourcePosition.getX() - range) >> 4;
++            this.lowerY = WorldUtil.getMinSection(poiStorage.levelHeightAccessor);
++            this.lowerZ = Mth.floor(sourcePosition.getZ() - range) >> 4;
++            this.upperX = Mth.floor(sourcePosition.getX() + range) >> 4;
++            this.upperY = WorldUtil.getMaxSection(poiStorage.levelHeightAccessor);
++            this.upperZ = Mth.floor(sourcePosition.getZ() + range) >> 4;
++
++            final int centerX = sourcePosition.getX() >> 4;
++            final int centerY = Mth.clamp(sourcePosition.getY() >> 4, lowerY, upperY);
++            final int centerZ = sourcePosition.getZ() >> 4;
++            final long centerKey = CoordinateUtils.getChunkSectionKey(centerX, centerY, centerZ);
++
++            seen.add(centerKey);
++            queue.enqueue(centerKey);
+ 
+-            if (sectionX < lowerX || sectionX > upperX || sectionY < lowerY || sectionY > upperY || sectionZ < lowerZ || sectionZ > upperZ) {
+-                // out of bound chunk
+-                continue;
+-            }
++        }
+ 
+-            final double sectionDistanceSquared = getSmallestDistanceSquared(
+-                    (double)(sectionX << 4),
+-                    (double)(sectionY << 4),
+-                    (double)(sectionZ << 4),
+-                    (double)((sectionX << 4) | 15),
+-                    (double)((sectionY << 4) | 15),
+-                    (double)((sectionZ << 4) | 15),
+-                    (double)sourcePosition.getX(), (double)sourcePosition.getY(), (double)sourcePosition.getZ()
+-            );
++        @Override
++        public boolean advance(final java.util.function.LongFunction<Optional<PoiSection>> sections) {
++            if (finished) return true;
++            while (!queue.isEmpty()) {
++                final long key = queue.firstLong();
++                final int sectionX = CoordinateUtils.getChunkSectionX(key);
++                final int sectionY = CoordinateUtils.getChunkSectionY(key);
++                final int sectionZ = CoordinateUtils.getChunkSectionZ(key);
++
++                if (sectionX < lowerX || sectionX > upperX || sectionY < lowerY || sectionY > upperY || sectionZ < lowerZ || sectionZ > upperZ) {
++                    // out of bound chunk
++                    queue.dequeueLong();
++                    continue;
++                }
+ 
+-            if (sectionDistanceSquared > (totalRecords >= max ? furthestDistanceSquared : maxDistanceSquared)) {
+-                continue;
+-            }
++                final double sectionDistanceSquared = getSmallestDistanceSquared(
++                        (double)(sectionX << 4),
++                        (double)(sectionY << 4),
++                        (double)(sectionZ << 4),
++                        (double)((sectionX << 4) | 15),
++                        (double)((sectionY << 4) | 15),
++                        (double)((sectionZ << 4) | 15),
++                        (double)sourcePosition.getX(), (double)sourcePosition.getY(), (double)sourcePosition.getZ()
++                );
++
++                if (sectionDistanceSquared > (totalRecords >= max ? furthestDistanceSquared : maxDistanceSquared)) {
++                    queue.dequeueLong();
++                    continue;
++                }
+ 
+-            // queue all neighbours
+-            for (int dz = -1; dz <= 1; ++dz) {
+-                for (int dx = -1; dx <= 1; ++dx) {
+-                    for (int dy = -1; dy <= 1; ++dy) {
+-                        // -1 and 1 have the 1st bit set. so just add up the first bits, and it will tell us how many
+-                        // values are set. we only care about cardinal neighbours, so, we only care if one value is set
+-                        if ((dx & 1) + (dy & 1) + (dz & 1) != 1) {
+-                            continue;
+-                        }
++                final Optional<PoiSection> poiSectionOptional = sections.apply(key);
++                if (poiSectionOptional == null) return false;
++                queue.dequeueLong();
++
++                // queue all neighbours
++                for (int dz = -1; dz <= 1; ++dz) {
++                    for (int dx = -1; dx <= 1; ++dx) {
++                        for (int dy = -1; dy <= 1; ++dy) {
++                            // -1 and 1 have the 1st bit set. so just add up the first bits, and it will tell us how many
++                            // values are set. we only care about cardinal neighbours, so, we only care if one value is set
++                            if ((dx & 1) + (dy & 1) + (dz & 1) != 1) {
++                                continue;
++                            }
+ 
+-                        final int neighbourX = sectionX + dx;
+-                        final int neighbourY = sectionY + dy;
+-                        final int neighbourZ = sectionZ + dz;
++                            final int neighbourX = sectionX + dx;
++                            final int neighbourY = sectionY + dy;
++                            final int neighbourZ = sectionZ + dz;
+ 
+-                        final long neighbourKey = CoordinateUtils.getChunkSectionKey(neighbourX, neighbourY, neighbourZ);
+-                        if (seen.add(neighbourKey)) {
+-                            queue.enqueue(neighbourKey);
++                            final long neighbourKey = CoordinateUtils.getChunkSectionKey(neighbourX, neighbourY, neighbourZ);
++                            if (seen.add(neighbourKey)) {
++                                queue.enqueue(neighbourKey);
++                            }
+                         }
+                     }
+                 }
+-            }
+-
+-            final Optional<PoiSection> poiSectionOptional = load ? poiStorage.getOrLoad(key) : poiStorage.get(key);
+-
+-            if (poiSectionOptional == null || !poiSectionOptional.isPresent()) {
+-                continue;
+-            }
+-
+-            final PoiSection poiSection = poiSectionOptional.get();
+ 
+-            final Map<Holder<PoiType>, Set<PoiRecord>> sectionData = poiSection.byType;
+-            if (sectionData.isEmpty()) {
+-                continue;
+-            }
+ 
+-            // now we search the section data
+-            for (final Map.Entry<Holder<PoiType>, Set<PoiRecord>> entry : sectionData.entrySet()) {
+-                if (!villagePlaceType.test(entry.getKey())) {
+-                    // filter out by poi type
++                if (poiSectionOptional == null || !poiSectionOptional.isPresent()) {
+                     continue;
+                 }
+ 
+-                // now we can look at the poi data
+-                for (final PoiRecord poiData : entry.getValue()) {
+-                    if (!occupancyFilter.test(poiData)) {
+-                        // filter by occupancy
+-                        continue;
+-                    }
++                final PoiSection poiSection = poiSectionOptional.get();
+ 
+-                    final BlockPos poiPosition = poiData.getPos();
++                final Map<Holder<PoiType>, Set<PoiRecord>> sectionData = poiSection.byType;
++                if (sectionData.isEmpty()) {
++                    continue;
++                }
+ 
+-                    if (Math.abs(poiPosition.getX() - sourcePosition.getX()) > range
+-                            || Math.abs(poiPosition.getZ() - sourcePosition.getZ()) > range) {
+-                        // out of range for square radius
++                // now we search the section data
++                for (final Map.Entry<Holder<PoiType>, Set<PoiRecord>> entry : sectionData.entrySet()) {
++                    if (!villagePlaceType.test(entry.getKey())) {
++                        // filter out by poi type
+                         continue;
+                     }
+ 
+-                    // it's important that it's poiPosition.distSqr(source) : the value actually is different IF the values are swapped!
+-                    final double dataRange = poiPosition.distSqr(sourcePosition);
+-
+-                    if (dataRange > maxDistanceSquared) {
+-                        // out of range for distance check
+-                        continue;
+-                    }
++                    // now we can look at the poi data
++                    for (final PoiRecord poiData : entry.getValue()) {
++                        if (!occupancyFilter.test(poiData)) {
++                            // filter by occupancy
++                            continue;
++                        }
+ 
+-                    if (dataRange > furthestDistanceSquared && totalRecords >= max) {
+-                        // out of range for distance check
+-                        continue;
+-                    }
++                        final BlockPos poiPosition = poiData.getPos();
+ 
+-                    if (positionPredicate != null && !positionPredicate.test(poiPosition)) {
+-                        // filter by position
+-                        continue;
+-                    }
++                        if (Math.abs(poiPosition.getX() - sourcePosition.getX()) > range
++                                || Math.abs(poiPosition.getZ() - sourcePosition.getZ()) > range) {
++                            // out of range for square radius
++                            continue;
++                        }
+ 
+-                    if (dataRange > furthestDistanceSquared) {
+-                        // we know totalRecords < max, so this entry is now our furthest
+-                        furthestDistanceSquared = dataRange;
+-                    }
++                        // it's important that it's poiPosition.distSqr(source) : the value actually is different IF the values are swapped!
++                        final double dataRange = poiPosition.distSqr(sourcePosition);
+ 
+-                    closestRecords.computeIfAbsent(dataRange, (final double unused) -> {
+-                        return new ArrayList<>();
+-                    }).add(poiData);
++                        if (dataRange > maxDistanceSquared) {
++                            // out of range for distance check
++                            continue;
++                        }
+ 
+-                    if (++totalRecords >= max) {
+-                        if (closestRecords.size() >= 2) {
+-                            int entriesInClosest = 0;
+-                            final Iterator<Double2ObjectMap.Entry<List<PoiRecord>>> iterator = closestRecords.double2ObjectEntrySet().iterator();
+-                            double nextFurthestDistanceSquared = 0.0;
++                        if (dataRange > furthestDistanceSquared && totalRecords >= max) {
++                            // out of range for distance check
++                            continue;
++                        }
+ 
+-                            for (int i = 0, len = closestRecords.size() - 1; i < len; ++i) {
+-                                final Double2ObjectMap.Entry<List<PoiRecord>> recordEntry = iterator.next();
+-                                entriesInClosest += recordEntry.getValue().size();
+-                                nextFurthestDistanceSquared = recordEntry.getDoubleKey();
+-                            }
++                        if (positionPredicate != null && !positionPredicate.test(poiPosition)) {
++                            // filter by position
++                            continue;
++                        }
+ 
+-                            if (entriesInClosest >= max) {
+-                                // the last set of entries at range wont even be considered for sure... nuke em
+-                                final Double2ObjectMap.Entry<List<PoiRecord>> recordEntry = iterator.next();
+-                                totalRecords -= recordEntry.getValue().size();
+-                                iterator.remove();
++                        if (dataRange > furthestDistanceSquared) {
++                            // we know totalRecords < max, so this entry is now our furthest
++                            furthestDistanceSquared = dataRange;
++                        }
+ 
+-                                furthestDistanceSquared = nextFurthestDistanceSquared;
++                        closestRecords.computeIfAbsent(dataRange, (final double unused) -> {
++                            return new ArrayList<>();
++                        }).add(poiData);
++
++                        if (++totalRecords >= max) {
++                            if (closestRecords.size() >= 2) {
++                                int entriesInClosest = 0;
++                                final Iterator<Double2ObjectMap.Entry<List<PoiRecord>>> iterator = closestRecords.double2ObjectEntrySet().iterator();
++                                double nextFurthestDistanceSquared = 0.0;
++
++                                for (int i = 0, len = closestRecords.size() - 1; i < len; ++i) {
++                                    final Double2ObjectMap.Entry<List<PoiRecord>> recordEntry = iterator.next();
++                                    entriesInClosest += recordEntry.getValue().size();
++                                    nextFurthestDistanceSquared = recordEntry.getDoubleKey();
++                                }
++
++                                if (entriesInClosest >= max) {
++                                    // the last set of entries at range wont even be considered for sure... nuke em
++                                    final Double2ObjectMap.Entry<List<PoiRecord>> recordEntry = iterator.next();
++                                    totalRecords -= recordEntry.getValue().size();
++                                    iterator.remove();
++
++                                    furthestDistanceSquared = nextFurthestDistanceSquared;
++                                }
+                             }
+                         }
+                     }
+                 }
+             }
+-        }
+ 
+-        final List<PoiRecord> closestRecordsUnsorted = new ArrayList<>();
++            final List<PoiRecord> closestRecordsUnsorted = new ArrayList<>();
+ 
+-        // we're done here, so now just flatten the map and sort it.
++            // we're done here, so now just flatten the map and sort it.
+ 
+-        for (final List<PoiRecord> records : closestRecords.values()) {
+-            closestRecordsUnsorted.addAll(records);
+-        }
++            for (final List<PoiRecord> records : closestRecords.values()) {
++                closestRecordsUnsorted.addAll(records);
++            }
+ 
+-        // uh oh! we might have multiple records that match the distance sorting!
+-        // we need to re-order our results by the way vanilla would have iterated over them.
+-        closestRecordsUnsorted.sort((record1, record2) -> {
+-            // vanilla iterates the same way we do for data inside sections, so we know the ordering inside a section
+-            // is fine and should be preserved (this sort is stable so we're good there)
+-            // but they iterate sections by x then by z (like the following)
+-            // for (int x = -dx; x <= dx; ++x)
+-            //     for (int z = -dz; z <= dz; ++z)
+-            //  ....
+-            // so we need to reorder such that records with lower chunk z, then lower chunk x come first
+-            final BlockPos pos1 = record1.getPos();
+-            final BlockPos pos2 = record2.getPos();
++            // uh oh! we might have multiple records that match the distance sorting!
++            // we need to re-order our results by the way vanilla would have iterated over them.
++            closestRecordsUnsorted.sort((record1, record2) -> {
++                // vanilla iterates the same way we do for data inside sections, so we know the ordering inside a section
++                // is fine and should be preserved (this sort is stable so we're good there)
++                // but they iterate sections by x then by z (like the following)
++                // for (int x = -dx; x <= dx; ++x)
++                //     for (int z = -dz; z <= dz; ++z)
++                //  ....
++                // so we need to reorder such that records with lower chunk z, then lower chunk x come first
++                final BlockPos pos1 = record1.getPos();
++                final BlockPos pos2 = record2.getPos();
++
++                final int cx1 = pos1.getX() >> 4;
++                final int cz1 = pos1.getZ() >> 4;
++
++                final int cx2 = pos2.getX() >> 4;
++                final int cz2 = pos2.getZ() >> 4;
++
++                if (cz2 != cz1) {
++                    // want smaller z
++                    return Integer.compare(cz1, cz2);
++                }
+ 
+-            final int cx1 = pos1.getX() >> 4;
+-            final int cz1 = pos1.getZ() >> 4;
++                if (cx2 != cx1) {
++                    // want smaller x
++                    return Integer.compare(cx1, cx2);
++                }
+ 
+-            final int cx2 = pos2.getX() >> 4;
+-            final int cz2 = pos2.getZ() >> 4;
++                // same chunk
++                // once vanilla has the chunk, it will iterate from all of the chunk sections starting from smaller y
++                // so now we just compare section y, wanting smaller section y
+ 
+-            if (cz2 != cz1) {
+-                // want smaller z
+-                return Integer.compare(cz1, cz2);
+-            }
++                return Integer.compare(pos1.getY() >> 4, pos2.getY() >> 4);
++            });
+ 
+-            if (cx2 != cx1) {
+-                // want smaller x
+-                return Integer.compare(cx1, cx2);
++            // trim out any entries exceeding our maximum
++            for (int i = closestRecordsUnsorted.size() - 1; i >= max; --i) {
++                closestRecordsUnsorted.remove(i);
+             }
+ 
+-            // same chunk
+-            // once vanilla has the chunk, it will iterate from all of the chunk sections starting from smaller y
+-            // so now we just compare section y, wanting smaller section y
+-
+-            return Integer.compare(pos1.getY() >> 4, pos2.getY() >> 4);
+-        });
+-
+-        // trim out any entries exceeding our maximum
+-        for (int i = closestRecordsUnsorted.size() - 1; i >= max; --i) {
+-            closestRecordsUnsorted.remove(i);
++            // now we match perfectly what vanilla would have outputted, without having to search the whole radius (hopefully).
++            ret.addAll(closestRecordsUnsorted);
++            finished = true;
++            return true;
+         }
+ 
+-        // now we match perfectly what vanilla would have outputted, without having to search the whole radius (hopefully).
+-        ret.addAll(closestRecordsUnsorted);
++        @Override
++        public List<PoiRecord> result() { return ret; }
+     }
+ 
+     public static BlockPos findAnyPoiPosition(final PoiManager poiStorage,
+@@ -617,80 +664,9 @@ public final class PoiAccess {
+                                          final boolean load,
+                                          final int max,
+                                          final List<PoiRecord> ret) {
+-        // the biggest issue with the original mojang implementation is that they chain so many streams together
+-        // the amount of streams chained just rolls performance, even if nothing is iterated over
+-        final Predicate<? super PoiRecord> occupancyFilter = occupancy.getTest();
+-
+-        int added = 0;
+-
+-        // First up, we need to iterate the chunks
+-        // all the values here are in chunk sections
+-        final int lowerX = Mth.floor(sourcePosition.getX() - range) >> 4;
+-        final int lowerY = Math.max(WorldUtil.getMinSection(poiStorage.levelHeightAccessor), Mth.floor(sourcePosition.getY() - range) >> 4);
+-        final int lowerZ = Mth.floor(sourcePosition.getZ() - range) >> 4;
+-        final int upperX = Mth.floor(sourcePosition.getX() + range) >> 4;
+-        final int upperY = Math.min(WorldUtil.getMaxSection(poiStorage.levelHeightAccessor), Mth.floor(sourcePosition.getY() + range) >> 4);
+-        final int upperZ = Mth.floor(sourcePosition.getZ() + range) >> 4;
+-
+-        // Vanilla iterates by x until max is reached then increases z
+-        // vanilla also searches by increasing Y section value
+-        for (int currZ = lowerZ; currZ <= upperZ; ++currZ) {
+-            for (int currX = lowerX; currX <= upperX; ++currX) {
+-                for (int currY = lowerY; currY <= upperY; ++currY) { // vanilla searches the entire chunk because they're actually stupid. just search the sections we need
+-                    final Optional<PoiSection> poiSectionOptional = load ? poiStorage.getOrLoad(CoordinateUtils.getChunkSectionKey(currX, currY, currZ)) :
+-                            poiStorage.get(CoordinateUtils.getChunkSectionKey(currX, currY, currZ));
+-                    final PoiSection poiSection = poiSectionOptional == null ? null : poiSectionOptional.orElse(null);
+-                    if (poiSection == null) {
+-                        continue;
+-                    }
+-
+-                    final Map<Holder<PoiType>, Set<PoiRecord>> sectionData = poiSection.byType;
+-                    if (sectionData.isEmpty()) {
+-                        continue;
+-                    }
+-
+-                    // now we search the section data
+-                    for (final Map.Entry<Holder<PoiType>, Set<PoiRecord>> entry : sectionData.entrySet()) {
+-                        if (!villagePlaceType.test(entry.getKey())) {
+-                            // filter out by poi type
+-                            continue;
+-                        }
+-
+-                        // now we can look at the poi data
+-                        for (final PoiRecord poiData : entry.getValue()) {
+-                            if (!occupancyFilter.test(poiData)) {
+-                                // filter by occupancy
+-                                continue;
+-                            }
+-
+-                            final BlockPos poiPosition = poiData.getPos();
+-
+-                            if (Math.abs(poiPosition.getX() - sourcePosition.getX()) > range
+-                                    || Math.abs(poiPosition.getZ() - sourcePosition.getZ()) > range) {
+-                                // out of range for square radius
+-                                continue;
+-                            }
+-
+-                            if (poiPosition.distSqr(sourcePosition) > maxDistanceSqr) {
+-                                // out of range for distance check
+-                                continue;
+-                            }
+-
+-                            if (positionPredicate != null && !positionPredicate.test(poiPosition)) {
+-                                // filter by position
+-                                continue;
+-                            }
+-
+-                            // found one!
+-                            ret.add(poiData);
+-                            if (++added >= max) {
+-                                return;
+-                            }
+-                        }
+-                    }
+-                }
+-            }
+-        }
++        final Search search = new AnySearch(poiStorage, villagePlaceType, positionPredicate == null ? null : (type, pos) -> positionPredicate.test(pos), sourcePosition, range, maxDistanceSqr, occupancy, max);
++        search.advance(key -> load ? poiStorage.getOrLoad(key) : java.util.Objects.requireNonNullElse(poiStorage.get(key), Optional.empty()));
++        ret.addAll(search.result());
+     }
+ 
+     public static PoiRecord findAnyPoiRecord(final PoiManager poiStorage,
+@@ -716,80 +692,74 @@ public final class PoiAccess {
+                                          final boolean load,
+                                          final int max,
+                                          final List<PoiRecord> ret) {
+-        // the biggest issue with the original mojang implementation is that they chain so many streams together
+-        // the amount of streams chained just rolls performance, even if nothing is iterated over
+-        final Predicate<? super PoiRecord> occupancyFilter = occupancy.getTest();
+-
+-        int added = 0;
+-
+-        // First up, we need to iterate the chunks
+-        // all the values here are in chunk sections
+-        final int lowerX = Mth.floor(sourcePosition.getX() - range) >> 4;
+-        final int lowerY = Math.max(WorldUtil.getMinSection(poiStorage.levelHeightAccessor), Mth.floor(sourcePosition.getY() - range) >> 4);
+-        final int lowerZ = Mth.floor(sourcePosition.getZ() - range) >> 4;
+-        final int upperX = Mth.floor(sourcePosition.getX() + range) >> 4;
+-        final int upperY = Math.min(WorldUtil.getMaxSection(poiStorage.levelHeightAccessor), Mth.floor(sourcePosition.getY() + range) >> 4);
+-        final int upperZ = Mth.floor(sourcePosition.getZ() + range) >> 4;
+-
+-        // Vanilla iterates by x until max is reached then increases z
+-        // vanilla also searches by increasing Y section value
+-        for (int currZ = lowerZ; currZ <= upperZ; ++currZ) {
+-            for (int currX = lowerX; currX <= upperX; ++currX) {
+-                for (int currY = lowerY; currY <= upperY; ++currY) { // vanilla searches the entire chunk because they're actually stupid. just search the sections we need
+-                    final Optional<PoiSection> poiSectionOptional = load ? poiStorage.getOrLoad(CoordinateUtils.getChunkSectionKey(currX, currY, currZ)) :
+-                            poiStorage.get(CoordinateUtils.getChunkSectionKey(currX, currY, currZ));
+-                    final PoiSection poiSection = poiSectionOptional == null ? null : poiSectionOptional.orElse(null);
+-                    if (poiSection == null) {
+-                        continue;
+-                    }
+-
+-                    final Map<Holder<PoiType>, Set<PoiRecord>> sectionData = poiSection.byType;
+-                    if (sectionData.isEmpty()) {
+-                        continue;
+-                    }
+-
+-                    // now we search the section data
+-                    for (final Map.Entry<Holder<PoiType>, Set<PoiRecord>> entry : sectionData.entrySet()) {
+-                        if (!villagePlaceType.test(entry.getKey())) {
+-                            // filter out by poi type
+-                            continue;
+-                        }
+-
+-                        // now we can look at the poi data
+-                        for (final PoiRecord poiData : entry.getValue()) {
+-                            if (!occupancyFilter.test(poiData)) {
+-                                // filter by occupancy
+-                                continue;
+-                            }
+-
+-                            final BlockPos poiPosition = poiData.getPos();
+-
+-                            if (Math.abs(poiPosition.getX() - sourcePosition.getX()) > range
+-                                    || Math.abs(poiPosition.getZ() - sourcePosition.getZ()) > range) {
+-                                // out of range for square radius
+-                                continue;
+-                            }
+-
+-                            if (poiPosition.distSqr(sourcePosition) > maxDistanceSqr) {
+-                                // out of range for distance check
+-                                continue;
+-                            }
++        final Search search = new AnySearch(poiStorage, villagePlaceType, positionPredicate, sourcePosition, range, maxDistanceSqr, occupancy, max);
++        search.advance(key -> load ? poiStorage.getOrLoad(key) : java.util.Objects.requireNonNullElse(poiStorage.get(key), Optional.empty()));
++        ret.addAll(search.result());
++    }
+ 
+-                            if (positionPredicate != null && !positionPredicate.test(poiData.getPoiType(), poiPosition)) {
+-                                // filter by position
+-                                continue;
+-                            }
++    public static final class AnySearch implements Search {
++        private final Predicate<Holder<PoiType>> villagePlaceType;
++        private final BiPredicate<Holder<PoiType>, BlockPos> positionPredicate;
++        private final Predicate<? super PoiRecord> occupancyFilter;
++        private final BlockPos sourcePosition;
++        private final int range, max, lowerX, lowerY, upperX, upperY, upperZ;
++        private final double maxDistanceSqr;
++        private int currX, currY, currZ;
++        private final List<PoiRecord> ret = new ArrayList<>();
++        private boolean finished;
++
++        public AnySearch(final PoiManager poiStorage, final Predicate<Holder<PoiType>> villagePlaceType,
++                         final BiPredicate<Holder<PoiType>, BlockPos> positionPredicate, final BlockPos sourcePosition,
++                         final int range, final double maxDistanceSqr, final PoiManager.Occupancy occupancy, final int max) {
++            this.villagePlaceType = villagePlaceType;
++            this.positionPredicate = positionPredicate;
++            this.occupancyFilter = occupancy.getTest();
++            this.sourcePosition = sourcePosition.immutable();
++            this.range = range;
++            this.maxDistanceSqr = maxDistanceSqr;
++            this.max = max;
++            this.lowerX = Mth.floor(sourcePosition.getX() - range) >> 4;
++            this.lowerY = Math.max(WorldUtil.getMinSection(poiStorage.levelHeightAccessor), Mth.floor(sourcePosition.getY() - range) >> 4);
++            this.upperX = Mth.floor(sourcePosition.getX() + range) >> 4;
++            this.upperY = Math.min(WorldUtil.getMaxSection(poiStorage.levelHeightAccessor), Mth.floor(sourcePosition.getY() + range) >> 4);
++            this.upperZ = Mth.floor(sourcePosition.getZ() + range) >> 4;
++            this.currX = lowerX;
++            this.currY = lowerY;
++            this.currZ = Mth.floor(sourcePosition.getZ() - range) >> 4;
++        }
+ 
+-                            // found one!
+-                            ret.add(poiData);
+-                            if (++added >= max) {
+-                                return;
+-                            }
++        @Override
++        public boolean advance(final java.util.function.LongFunction<Optional<PoiSection>> sections) {
++            if (finished) return true;
++            if (lowerY > upperY) { finished = true; return true; }
++            while (currZ <= upperZ) {
++                final Optional<PoiSection> section = sections.apply(CoordinateUtils.getChunkSectionKey(currX, currY, currZ));
++                if (section == null) return false;
++                if (section.isPresent()) {
++                    for (final Map.Entry<Holder<PoiType>, Set<PoiRecord>> entry : section.get().byType.entrySet()) {
++                        if (!villagePlaceType.test(entry.getKey())) continue;
++                        for (final PoiRecord record : entry.getValue()) {
++                            if (!occupancyFilter.test(record)) continue;
++                            final BlockPos pos = record.getPos();
++                            if (Math.abs(pos.getX() - sourcePosition.getX()) > range || Math.abs(pos.getZ() - sourcePosition.getZ()) > range) continue;
++                            if (pos.distSqr(sourcePosition) > maxDistanceSqr) continue;
++                            if (positionPredicate != null && !positionPredicate.test(record.getPoiType(), pos)) continue;
++                            ret.add(record);
++                            if (ret.size() >= max) { finished = true; return true; }
+                         }
+                     }
+                 }
++                if (++currY > upperY) {
++                    currY = lowerY;
++                    if (++currX > upperX) { currX = lowerX; ++currZ; }
++                }
+             }
++            finished = true;
++            return true;
+         }
++
++        @Override
++        public List<PoiRecord> result() { return ret; }
+     }
+ 
+     private PoiAccess() {
+diff --git a/ca/spottedleaf/moonrise/patches/poi_lookup/PoiSearchTask.java b/ca/spottedleaf/moonrise/patches/poi_lookup/PoiSearchTask.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..f9d08fbd8323f45dc3b2b64f9f3271b12c494989
+--- /dev/null
++++ b/ca/spottedleaf/moonrise/patches/poi_lookup/PoiSearchTask.java
+@@ -0,0 +1,119 @@
++package ca.spottedleaf.moonrise.patches.poi_lookup;
++
++import ca.spottedleaf.moonrise.common.util.CoordinateUtils;
++import ca.spottedleaf.moonrise.common.util.TickThread;
++import ca.spottedleaf.moonrise.patches.chunk_system.level.ChunkSystemServerLevel;
++import ca.spottedleaf.moonrise.patches.chunk_system.level.poi.PoiChunk;
++import ca.spottedleaf.moonrise.patches.chunk_system.scheduling.ChunkHolderManager;
++import it.unimi.dsi.fastutil.longs.Long2ObjectOpenHashMap;
++import java.util.List;
++import java.util.Optional;
++import java.util.function.Consumer;
++import java.util.function.Predicate;
++import net.minecraft.core.BlockPos;
++import net.minecraft.server.level.ServerLevel;
++import net.minecraft.util.Util;
++import net.minecraft.world.entity.Entity;
++import net.minecraft.world.entity.Mob;
++import net.minecraft.world.entity.ai.village.poi.PoiRecord;
++import net.minecraft.world.entity.ai.village.poi.PoiSection;
++
++/** Resumes a POI cursor on its entity owner while retaining exactly the chunks it has visited. */
++public final class PoiSearchTask {
++    private final Mob body;
++    private final ServerLevel level;
++    private final BlockPos origin;
++    private final net.minecraft.world.entity.ai.Brain<?> brain;
++    private final PoiAccess.Search search;
++    private final Predicate<Mob> valid;
++    private final Consumer<List<PoiRecord>> complete;
++    private final Runnable finished;
++    private final ChunkHolderManager manager;
++    private final Long2ObjectOpenHashMap<ChunkHolderManager.PoiChunkLease> leases = new Long2ObjectOpenHashMap<>();
++
++    private PoiSearchTask(final Mob body, final PoiAccess.Search search, final Predicate<Mob> valid,
++                          final Consumer<List<PoiRecord>> complete, final Runnable finished) {
++        this.body = body;
++        this.level = (ServerLevel)body.level();
++        this.origin = body.blockPosition().immutable();
++        this.brain = body.getBrain();
++        this.search = search;
++        this.valid = valid;
++        this.complete = complete;
++        this.finished = finished;
++        this.manager = ((ChunkSystemServerLevel)this.level).moonrise$getChunkTaskScheduler().chunkHolderManager;
++    }
++
++    public static void start(final Mob body, final PoiAccess.Search search, final Predicate<Mob> valid,
++                             final Consumer<List<PoiRecord>> complete, final Runnable finished) {
++        TickThread.ensureTickThread(body, "Starting POI search off owner");
++        new PoiSearchTask(body, search, valid, complete, finished).run(body);
++    }
++
++    private void run(final Entity current) {
++        boolean waiting = false;
++        try {
++            if (current != this.body || !current.isAlive() || current.isRemoved() || current.level() != this.level
++                || this.body.isNoAi() || this.body.getBrain() != this.brain
++                || !current.blockPosition().equals(this.origin) || !this.valid.test(this.body)) return;
++            // A region may split or the entity may transfer while an IO request is pending.
++            for (final long key : this.leases.keySet()) {
++                if (!TickThread.isTickThreadFor(this.level, CoordinateUtils.getChunkX(key), CoordinateUtils.getChunkZ(key))) return;
++            }
++            if (this.search.advance(this::section)) {
++                this.complete.accept(this.search.result());
++            } else {
++                waiting = this.body.getBukkitEntity().taskScheduler.schedule(this::run, ignored -> this.retired(), 1L);
++            }
++        } catch (final LostOwnership ignored) {
++            // Retry from the entity's current region on the next normal AI attempt.
++        } finally {
++            if (!waiting) {
++                try {
++                    this.close();
++                } finally {
++                    this.finished.run();
++                }
++            }
++        }
++    }
++
++    private Optional<PoiSection> section(final long sectionKey) {
++        final int x = CoordinateUtils.getChunkSectionX(sectionKey);
++        final int z = CoordinateUtils.getChunkSectionZ(sectionKey);
++        if (!TickThread.isTickThreadFor(this.level, x, z)) throw new LostOwnership();
++        final long chunkKey = CoordinateUtils.getChunkKey(x, z);
++        ChunkHolderManager.PoiChunkLease lease = this.leases.get(chunkKey);
++        if (lease == null) {
++            lease = this.manager.acquirePoiChunk(x, z);
++            this.leases.put(chunkKey, lease);
++        }
++        final PoiChunk chunk = lease.getIfReady();
++        if (chunk == null) return null;
++        chunk.load();
++        return chunk.getSectionForVanilla(CoordinateUtils.getChunkSectionY(sectionKey));
++    }
++
++    private void retired() {
++        // Entity retirement runs inside entity removal; ticket changes must happen outside that critical section.
++        Util.ioPool().execute(this::close);
++    }
++
++    private void close() {
++        Throwable failure = null;
++        for (final ChunkHolderManager.PoiChunkLease lease : this.leases.values()) {
++            try {
++                lease.close();
++            } catch (final Throwable caught) {
++                if (failure == null) failure = caught;
++                else failure.addSuppressed(caught);
++            }
++        }
++        this.leases.clear();
++        if (failure != null) throw new IllegalStateException("Failed to release POI search leases", failure);
++    }
++
++    private static final class LostOwnership extends RuntimeException {
++        private LostOwnership() { super(null, null, false, false); }
++    }
++}
+diff --git a/net/minecraft/world/entity/ai/behavior/AcquirePoi.java b/net/minecraft/world/entity/ai/behavior/AcquirePoi.java
+index e2eb02d8a0a9481be2308c9052582591bc4f9850..8ee0c1106628eb68c2bdbf87f0454f74ac3801b6 100644
+--- a/net/minecraft/world/entity/ai/behavior/AcquirePoi.java
++++ b/net/minecraft/world/entity/ai/behavior/AcquirePoi.java
+@@ -8,7 +8,6 @@ import java.util.Optional;
+ import java.util.Set;
+ import java.util.function.BiPredicate;
+ import java.util.function.Predicate;
+-import java.util.stream.Collectors;
+ import net.minecraft.core.BlockPos;
+ import net.minecraft.core.GlobalPos;
+ import net.minecraft.core.Holder;
+@@ -57,13 +56,14 @@ public class AcquirePoi {
+         int batchSize = 5;
+         int rate = 20;
+         MutableLong nextScheduledStart = new MutableLong(0L);
++        org.apache.commons.lang3.mutable.MutableBoolean searching = new org.apache.commons.lang3.mutable.MutableBoolean();
+         Long2ObjectMap<AcquirePoi.JitteredLinearRetry> batchCache = new Long2ObjectOpenHashMap<>();
+         OneShot<PathfinderMob> acquirePoi = BehaviorBuilder.create(
+             i -> i.group(i.absent(memoryToAcquire))
+                 .apply(
+                     i,
+                     toAcquire -> (level, body, timestamp) -> {
+-                        if (onlyIfAdult && body.isBaby()) {
++                        if (searching.booleanValue() || (onlyIfAdult && body.isBaby())) {
+                             return false;
+                         }
+ 
+@@ -94,31 +94,39 @@ public class AcquirePoi {
+                             retryMarker.markAttempt(timestamp);
+                             return true;
+                         };
+-                        // Paper start - optimise POI searches
+-                        java.util.List<Pair<Holder<PoiType>, BlockPos>> poiPositionsRaw = new java.util.ArrayList<>();
+-                        ca.spottedleaf.moonrise.patches.poi_lookup.PoiAccess.findNearestPoiPositions(poiManager, poiType, cacheTest, body.blockPosition(), SCAN_RANGE, Double.MAX_VALUE, PoiManager.Occupancy.HAS_SPACE, ca.spottedleaf.moonrise.patches.poi_lookup.PoiAccess.LOAD_FOR_SEARCHING, 5, poiPositionsRaw);
+-                        Set<Pair<Holder<PoiType>, BlockPos>> poiPositions = new java.util.HashSet<>(poiPositionsRaw.size());
+-                        for (Pair<Holder<PoiType>, BlockPos> pair : poiPositionsRaw) {
+-                            if (validPoi.test(level, pair.getSecond())) {
+-                                poiPositions.add(pair);
+-                            }
+-                        }
+-                        // Paper end - optimise POI searches
+-                        Path path = findPathToPois(body, poiPositions);
+-                        if (path != null && path.canReach()) {
+-                            BlockPos targetPos = path.getTarget();
+-                            poiManager.getType(targetPos).ifPresent(type -> {
+-                                poiManager.take(poiType, (t, poiPos) -> poiPos.equals(targetPos), targetPos, 1);
+-                                toAcquire.set(GlobalPos.of(level.dimension(), targetPos));
+-                                onPoiAcquisitionEvent.ifPresent(event -> level.broadcastEntityEvent(body, event));
+-                                batchCache.clear();
+-                                level.debugSynchronizers().updatePoi(targetPos);
+-                            });
+-                        } else {
+-                            for (Pair<Holder<PoiType>, BlockPos> p : poiPositions) {
+-                                batchCache.computeIfAbsent(p.getSecond().asLong(), key -> new AcquirePoi.JitteredLinearRetry(random, timestamp));
+-                            }
+-                        }
++                        searching.setTrue();
++                        Set<BlockPos> seenPositions = new HashSet<>();
++                        var search = new ca.spottedleaf.moonrise.patches.poi_lookup.PoiAccess.NearestSearch(
++                            poiManager, poiType, pos -> cacheTest.test(pos) && seenPositions.add(pos.immutable()),
++                            body.blockPosition(), SCAN_RANGE, Double.MAX_VALUE, PoiManager.Occupancy.HAS_SPACE, 5);
++                        ca.spottedleaf.moonrise.patches.poi_lookup.PoiSearchTask.start(body, search,
++                            current -> (!onlyIfAdult || !current.isBaby())
++                                && !current.getBrain().hasMemoryValue(memoryToAcquire)
++                                && !current.getBrain().hasMemoryValue(memoryToValidate),
++                            records -> {
++                                Set<Pair<Holder<PoiType>, BlockPos>> poiPositions = new java.util.HashSet<>(records.size());
++                                for (net.minecraft.world.entity.ai.village.poi.PoiRecord record : records) {
++                                    Pair<Holder<PoiType>, BlockPos> pair = Pair.of(record.getPoiType(), record.getPos());
++                                    if (poiManager.getType(pair.getSecond()).filter(pair.getFirst()::equals).isPresent() && validPoi.test(level, pair.getSecond())) {
++                                        poiPositions.add(pair);
++                                    }
++                                }
++                                Path path = findPathToPois(body, poiPositions);
++                                if (path != null && path.canReach()) {
++                                    BlockPos targetPos = path.getTarget();
++                                    poiManager.take(poiType, (t, poiPos) -> poiPos.equals(targetPos), targetPos, 0).ifPresent(taken -> {
++                                        toAcquire.set(GlobalPos.of(level.dimension(), targetPos));
++                                        onPoiAcquisitionEvent.ifPresent(event -> level.broadcastEntityEvent(body, event));
++                                        batchCache.clear();
++                                        level.debugSynchronizers().updatePoi(targetPos);
++                                    });
++                                } else {
++                                    for (Pair<Holder<PoiType>, BlockPos> p : poiPositions) {
++                                        batchCache.computeIfAbsent(p.getSecond().asLong(), key -> new AcquirePoi.JitteredLinearRetry(random, timestamp));
++                                    }
++                                }
++
++                            }, searching::setFalse);
+ 
+                         return true;
+                     }
+diff --git a/net/minecraft/world/entity/ai/behavior/SetClosestHomeAsWalkTarget.java b/net/minecraft/world/entity/ai/behavior/SetClosestHomeAsWalkTarget.java
+index 5bd7473b0db1a87f905c01c19ddf99e3a447bcfa..a5afa1ca89d4f07cb6b3784bc39da9a69964b45a 100644
+--- a/net/minecraft/world/entity/ai/behavior/SetClosestHomeAsWalkTarget.java
++++ b/net/minecraft/world/entity/ai/behavior/SetClosestHomeAsWalkTarget.java
+@@ -6,7 +6,6 @@ import it.unimi.dsi.fastutil.longs.Long2LongOpenHashMap;
+ import java.util.Optional;
+ import java.util.Set;
+ import java.util.function.Predicate;
+-import java.util.stream.Collectors;
+ import net.minecraft.core.BlockPos;
+ import net.minecraft.core.Holder;
+ import net.minecraft.world.entity.PathfinderMob;
+@@ -29,20 +28,29 @@ public class SetClosestHomeAsWalkTarget {
+     public static BehaviorControl<PathfinderMob> create(final float speedModifier) {
+         Long2LongMap batchCache = new Long2LongOpenHashMap();
+         MutableLong lastUpdate = new MutableLong(0L);
++        org.apache.commons.lang3.mutable.MutableBoolean searching = new org.apache.commons.lang3.mutable.MutableBoolean();
+         return BehaviorBuilder.create(
+             i -> i.group(i.absent(MemoryModuleType.WALK_TARGET), i.absent(MemoryModuleType.HOME))
+                 .apply(
+                     i,
+                     (walkTarget, home) -> (level, body, timestamp) -> {
+-                        if (level.getGameTime() - lastUpdate.longValue() < RATE) {
++                        if (searching.booleanValue() || level.getGameTime() - lastUpdate.longValue() < RATE) {
+                             return false;
+                         }
+ 
+                         PoiManager poiManager = level.getPoiManager();
+-                        Optional<BlockPos> closest = poiManager.findClosest(
+-                            p -> p.is(PoiTypes.HOME), body.blockPosition(), AcquirePoi.SCAN_RANGE, PoiManager.Occupancy.ANY
+-                        );
+-                        if (!closest.isEmpty() && !(closest.get().distSqr(body.blockPosition()) <= OK_DISTANCE_SQR)) {
++                        searching.setTrue();
++                        org.apache.commons.lang3.mutable.MutableBoolean transferred = new org.apache.commons.lang3.mutable.MutableBoolean();
++                        var activity = body.getBrain().getActiveNonCoreActivity();
++                        java.util.function.Predicate<net.minecraft.world.entity.Mob> valid = current ->
++                            activity.equals(current.getBrain().getActiveNonCoreActivity())
++                                && !current.getBrain().hasMemoryValue(MemoryModuleType.WALK_TARGET)
++                                && !current.getBrain().hasMemoryValue(MemoryModuleType.HOME);
++                        var closestSearch = new ca.spottedleaf.moonrise.patches.poi_lookup.PoiAccess.NearestSearch(
++                            poiManager, p -> p.is(PoiTypes.HOME), null, body.blockPosition(), AcquirePoi.SCAN_RANGE,
++                            (double)AcquirePoi.SCAN_RANGE * AcquirePoi.SCAN_RANGE, PoiManager.Occupancy.ANY, 1);
++                        ca.spottedleaf.moonrise.patches.poi_lookup.PoiSearchTask.start(body, closestSearch, valid, closest -> {
++                            if (closest.isEmpty() || closest.getFirst().getPos().distSqr(body.blockPosition()) <= OK_DISTANCE_SQR) return;
+                             MutableInt triedCount = new MutableInt(0);
+                             lastUpdate.setValue(level.getGameTime() + level.getRandom().nextInt(RATE));
+                             Predicate<BlockPos> cacheTest = pos -> {
+@@ -58,26 +66,34 @@ public class SetClosestHomeAsWalkTarget {
+                                 batchCache.put(key, lastUpdate.longValue() + CACHE_TIMEOUT);
+                                 return true;
+                             };
+-                            Set<Pair<Holder<PoiType>, BlockPos>> pois = poiManager.findAllWithType(
+-                                    p -> p.is(PoiTypes.HOME), cacheTest, body.blockPosition(), AcquirePoi.SCAN_RANGE, PoiManager.Occupancy.ANY
+-                                )
+-                                .collect(Collectors.toSet());
+-                            Path path = AcquirePoi.findPathToPois(body, pois);
+-                            if (path != null && path.canReach()) {
+-                                BlockPos targetPos = path.getTarget();
+-                                Optional<Holder<PoiType>> type = poiManager.getType(targetPos);
+-                                if (type.isPresent()) {
+-                                    walkTarget.set(new WalkTarget(targetPos, speedModifier, 1));
+-                                    level.debugSynchronizers().updatePoi(targetPos);
++
++                            var homesSearch = new ca.spottedleaf.moonrise.patches.poi_lookup.PoiAccess.AnySearch(
++                                poiManager, p -> p.is(PoiTypes.HOME), (type, pos) -> cacheTest.test(pos), body.blockPosition(),
++                                AcquirePoi.SCAN_RANGE, (double)AcquirePoi.SCAN_RANGE * AcquirePoi.SCAN_RANGE, PoiManager.Occupancy.ANY, Integer.MAX_VALUE);
++                            // The second query keeps the same attempt guard until its continuation finishes.
++                            transferred.setTrue();
++                            ca.spottedleaf.moonrise.patches.poi_lookup.PoiSearchTask.start(body, homesSearch, valid, records -> {
++                                Set<Pair<Holder<PoiType>, BlockPos>> pois = new java.util.HashSet<>();
++                                for (var record : records) {
++                                    if (poiManager.getType(record.getPos()).filter(record.getPoiType()::equals).isPresent()) {
++                                        pois.add(Pair.of(record.getPoiType(), record.getPos()));
++                                    }
++                                }
++                                Path path = AcquirePoi.findPathToPois(body, pois);
++                                if (path != null && path.canReach()) {
++                                    BlockPos targetPos = path.getTarget();
++                                    Optional<Holder<PoiType>> type = poiManager.getType(targetPos);
++                                    if (type.filter(p -> p.is(PoiTypes.HOME)).isPresent()) {
++                                        walkTarget.set(new WalkTarget(targetPos, speedModifier, 1));
++                                        level.debugSynchronizers().updatePoi(targetPos);
++                                    }
++                                } else if (triedCount.intValue() < BATCH_SIZE) {
++                                    batchCache.long2LongEntrySet().removeIf(entry -> entry.getLongValue() < lastUpdate.longValue());
+                                 }
+-                            } else if (triedCount.intValue() < BATCH_SIZE) {
+-                                batchCache.long2LongEntrySet().removeIf(entry -> entry.getLongValue() < lastUpdate.longValue());
+-                            }
+ 
+-                            return true;
+-                        } else {
+-                            return false;
+-                        }
++                            }, searching::setFalse);
++                        }, () -> { if (!transferred.booleanValue()) searching.setFalse(); });
++                        return searching.booleanValue() || transferred.booleanValue();
+                     }
+                 )
+         );
+-- 
+2.53.0.windows.1
+
