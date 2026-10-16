@@ -35,7 +35,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: >-
           gh release create "$GITHUB_REF_NAME"
-          dist/folia.jar dist/SHA256SUMS
+          dist/folia-*.jar dist/SHA256SUMS
           --repo "$GITHUB_REPOSITORY"
           --verify-tag
           --title "Folia $GITHUB_REF_NAME"

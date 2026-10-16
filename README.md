@@ -4,7 +4,9 @@ An independently maintained Folia fork for Minecraft 26.3. The maintained branch
 
 ## Builds and releases
 
-Pull requests and pushes to `kers/26.3.x` run [Patch and Build](.github/workflows/build.yml). The workflow applies patches, runs the repository build/check tasks and creates a Paperclip server. Its `folia-paperclip` artifact contains `folia.jar` and `SHA256SUMS` and is retained for 14 days. The workflow can also be started manually from GitHub Actions.
+Pull requests and pushes to `kers/26.3.x` run [Patch and Build](.github/workflows/build.yml). The workflow applies patches, runs the repository build/check tasks and creates a Paperclip server. Its `folia-paperclip` artifact contains `folia-26.3-B.jar` and `SHA256SUMS` and is retained for 14 days. The workflow can also be started manually from GitHub Actions.
+
+`B` is this fork's GitHub workflow run number, not an upstream Folia build number or release tag number. All downloadable builds set `BUILD_NUMBER` and a UTC `BUILD_STARTED_AT` before Gradle runs. The Gradle project version is `26.3.build.B-alpha`; the manifest implementation version is `26.3-B-<commit>`.
 
 After the selected changes have been reviewed and integrated, create a new immutable `26.3-kers.N` tag on the maintained branch and push it. For example:
 
