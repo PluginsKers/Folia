@@ -1,0 +1,17 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: PluginsKers <ikers@foxmail.com>
+Date: Sat, 17 Oct 2026 01:10:00 +0800
+Subject: [PATCH] Make the shared mob goal type cache thread-safe
+
+diff --git a/src/main/java/com/destroystokyo/paper/entity/ai/MobGoalHelper.java b/src/main/java/com/destroystokyo/paper/entity/ai/MobGoalHelper.java
+--- a/src/main/java/com/destroystokyo/paper/entity/ai/MobGoalHelper.java
++++ b/src/main/java/com/destroystokyo/paper/entity/ai/MobGoalHelper.java
+@@ -22,7 +22,7 @@ import org.bukkit.entity.*;
+ 
+ public class MobGoalHelper {
+ 
+-    private static final Map<Class<? extends Goal>, Class<? extends Mob>> GENERIC_TYPE_CACHE = new HashMap<>();
++    private static final Map<Class<? extends Goal>, Class<? extends Mob>> GENERIC_TYPE_CACHE = new java.util.concurrent.ConcurrentHashMap<>(); // Folia - shared across region threads
+     public static final Map<Class<? extends net.minecraft.world.entity.Mob>, Class<? extends Mob>> BUKKIT_BRIDGE = Util.make(new LinkedHashMap<>(), map -> {
+         //<editor-fold defaultstate="collapsed" desc="bukkitMap Entities">
+         // Start generate - MobGoalHelper#BUKKIT_BRIDGE
