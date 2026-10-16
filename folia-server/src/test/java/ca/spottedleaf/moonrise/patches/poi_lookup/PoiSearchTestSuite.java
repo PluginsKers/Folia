@@ -5,6 +5,6 @@ import org.junit.platform.suite.api.Suite;
 
 @Suite
 @SelectClasses({PoiSearchCursorTest.class, PoiSearchTaskTest.class, PoiChunkLeaseTest.class, PoiHomeBehaviorTest.class,
-    NearestBedSensorTest.class})
+    NearestBedSensorTest.class, CatSpawnerTest.class, io.papermc.paper.threadedregions.CatSpawnerLifecycleTest.class})
 public class PoiSearchTestSuite {
 }
