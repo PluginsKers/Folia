@@ -1,0 +1,35 @@
+From af550e6f44f93bdeeef2c177f0e4afa940a00bd5 Mon Sep 17 00:00:00 2001
+From: PluginsKers <ikers@foxmail.com>
+Date: Fri, 16 Oct 2026 09:19:58 +0800
+Subject: [PATCH] Expose asynchronous player data persistence
+
+---
+ src/main/java/org/bukkit/entity/Player.java | 15 +++++++++++++++
+ 1 file changed, 15 insertions(+)
+
+diff --git a/src/main/java/org/bukkit/entity/Player.java b/src/main/java/org/bukkit/entity/Player.java
+index 190313bc0..985d0ff0b 100644
+--- a/src/main/java/org/bukkit/entity/Player.java
++++ b/src/main/java/org/bukkit/entity/Player.java
+@@ -535,6 +535,21 @@ public interface Player extends HumanEntity, Conversable, OfflinePlayer, PluginM
+      */
+     public void saveData();
+ 
++    /**
++     * Captures this player's data on its owning region and saves it asynchronously.
++     * Writes for the same player are ordered. The returned future completes only
++     * after the complete snapshot has been written and read back successfully.
++     * This does not promise a filesystem flush to physical storage.
++     * <p>
++     * Must be called on this player's owning region. Completion may run on an I/O
++     * thread; schedule entity access back onto the player's scheduler. Cancelling
++     * the future does not cancel an accepted save. Disabled saving and failures
++     * complete the future exceptionally.
++     *
++     * @return the completion of this save
++     */
++    public java.util.concurrent.CompletableFuture<Void> saveDataAsync();
++
+     /**
+      * Loads the players current location, health, inventory, motion, and
+      * other information from the &lt;uuid&gt;.dat file, in the

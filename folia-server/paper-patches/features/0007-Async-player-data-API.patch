@@ -1,0 +1,25 @@
+From d5d6981a814341b9e80f9ab280ba4269bc487d6b Mon Sep 17 00:00:00 2001
+From: PluginsKers <ikers@foxmail.com>
+Date: Fri, 16 Oct 2026 09:19:57 +0800
+Subject: [PATCH] Expose asynchronous player data persistence
+
+---
+ src/main/java/org/bukkit/craftbukkit/entity/CraftPlayer.java | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/src/main/java/org/bukkit/craftbukkit/entity/CraftPlayer.java b/src/main/java/org/bukkit/craftbukkit/entity/CraftPlayer.java
+index aba936a53..04b47c515 100644
+--- a/src/main/java/org/bukkit/craftbukkit/entity/CraftPlayer.java
++++ b/src/main/java/org/bukkit/craftbukkit/entity/CraftPlayer.java
+@@ -1387,6 +1387,11 @@ public class CraftPlayer extends CraftHumanEntity implements Player, PluginMessa
+         this.server.getHandle().playerIo.save(this.getHandle());
+     }
+ 
++    @Override
++    public java.util.concurrent.CompletableFuture<Void> saveDataAsync() {
++        return this.server.getHandle().playerIo.saveAsync(this.getHandle());
++    }
++
+     @Deprecated
+     @Override
+     public void updateInventory() {
