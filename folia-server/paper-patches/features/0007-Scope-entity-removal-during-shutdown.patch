@@ -1,0 +1,48 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: PluginsKers <ikers@foxmail.com>
+Date: Thu, 15 Oct 2026 00:28:14 +0800
+Subject: [PATCH] fix: include entity removal preprocessing in the shutdown scope
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+
+diff --git a/src/main/java/org/bukkit/craftbukkit/entity/CraftEntity.java b/src/main/java/org/bukkit/craftbukkit/entity/CraftEntity.java
+index 8627438d1ad4e27934ce6586db3e8baf39373818..f8da1ccb6863cf1211c86338778cfd9363aa5f75 100644
+--- a/src/main/java/org/bukkit/craftbukkit/entity/CraftEntity.java
++++ b/src/main/java/org/bukkit/craftbukkit/entity/CraftEntity.java
+@@ -484,8 +484,16 @@ public abstract class CraftEntity implements org.bukkit.entity.Entity {
+ 
+     @Override
+     public void remove() {
++        if (io.papermc.paper.threadedregions.RegionShutdownThread.tryRunEntityRemoval(this.entity, this::removeInternal)) {
++            return;
++        }
++        this.removeInternal();
++    }
++
++    protected void removeInternal() {
++        final Entity handle = this.getHandle();
+         this.entity.pluginRemoved = true;
+-        this.entity.discard(this.getHandle().generation ? null : EntityRemoveEvent.Cause.PLUGIN);
++        handle.discard(handle.generation ? null : EntityRemoveEvent.Cause.PLUGIN);
+     }
+ 
+     @Override
+diff --git a/src/main/java/org/bukkit/craftbukkit/entity/CraftVillager.java b/src/main/java/org/bukkit/craftbukkit/entity/CraftVillager.java
+index 92eab10ec20f44e81d9e38bd9d4b6cf64dd6ef37..867382ed52923ddeb4c11df210d6fabeebaac068 100644
+--- a/src/main/java/org/bukkit/craftbukkit/entity/CraftVillager.java
++++ b/src/main/java/org/bukkit/craftbukkit/entity/CraftVillager.java
+@@ -41,10 +41,10 @@ public class CraftVillager extends CraftAbstractVillager implements Villager {
+     }
+ 
+     @Override
+-    public void remove() {
++    protected void removeInternal() {
+         this.getHandle().releaseAllPois();
+ 
+-        super.remove();
++        super.removeInternal();
+     }
+ 
+     @Override
