@@ -1,0 +1,165 @@
+From c214e7cad6190f3ea06dcd8c366a3f64444ed873 Mon Sep 17 00:00:00 2001
+From: PluginsKers <ikers@foxmail.com>
+Date: Fri, 16 Oct 2026 09:21:46 +0800
+Subject: [PATCH] Restore region context for entity removal during shutdown
+
+---
+ .../level/entity/EntityLookup.java            |  2 +-
+ .../threadedregions/RegionShutdownThread.java | 85 ++++++++++++++++++-
+ .../threadedregions/RegionizedTaskQueue.java  |  3 +
+ net/minecraft/world/entity/Entity.java        |  5 ++
+ 4 files changed, 93 insertions(+), 2 deletions(-)
+
+diff --git a/ca/spottedleaf/moonrise/patches/chunk_system/level/entity/EntityLookup.java b/ca/spottedleaf/moonrise/patches/chunk_system/level/entity/EntityLookup.java
+index 1e91958..f0466fd 100644
+--- a/ca/spottedleaf/moonrise/patches/chunk_system/level/entity/EntityLookup.java
++++ b/ca/spottedleaf/moonrise/patches/chunk_system/level/entity/EntityLookup.java
+@@ -1013,7 +1013,7 @@ public abstract class EntityLookup implements LevelEntityGetter<Entity> {
+         }
+     }
+ 
+-    protected static final class NoOpCallback implements EntityInLevelCallback {
++    public static final class NoOpCallback implements EntityInLevelCallback {
+ 
+         public static final NoOpCallback INSTANCE = new NoOpCallback();
+ 
+diff --git a/io/papermc/paper/threadedregions/RegionShutdownThread.java b/io/papermc/paper/threadedregions/RegionShutdownThread.java
+index 43997cc..fa3fed0 100644
+--- a/io/papermc/paper/threadedregions/RegionShutdownThread.java
++++ b/io/papermc/paper/threadedregions/RegionShutdownThread.java
+@@ -19,6 +19,8 @@ public final class RegionShutdownThread extends ca.spottedleaf.moonrise.common.u
+     private static final Logger LOGGER = LogUtils.getClassLogger();
+ 
+     ThreadedRegionizer.ThreadedRegion<TickRegions.TickRegionData, TickRegions.TickRegionSectionData> shuttingDown;
++    private boolean schedulerHalted;
++    private final List<ThreadedRegionizer.ThreadedRegion<TickRegions.TickRegionData, TickRegions.TickRegionSectionData>> borrowedRegions = new ArrayList<>();
+ 
+     public RegionShutdownThread(final String name) {
+         super(name);
+@@ -47,6 +49,87 @@ public final class RegionShutdownThread extends ca.spottedleaf.moonrise.common.u
+         return null;
+     }
+ 
++    public static boolean tryRunEntityRemoval(final Entity entity, final Runnable removal) {
++        if (!(Thread.currentThread() instanceof RegionShutdownThread shutdownThread)) {
++            return false;
++        }
++        shutdownThread.runEntityRemoval(entity, removal);
++        return true;
++    }
++
++    public static boolean tryRunTickTask(final ServerLevel world, final int chunkX, final int chunkZ, final Runnable task) {
++        if (!(Thread.currentThread() instanceof RegionShutdownThread shutdownThread)) {
++            return false;
++        }
++        shutdownThread.runTickTask(world, chunkX, chunkZ, task);
++        return true;
++    }
++
++    void runEntityRemoval(final Entity entity, final Runnable removal) {
++        this.requireHaltedScheduler();
++        if (entity.hasInactiveLevelCallback()) {
++            this.runInRegion(null, removal);
++            return;
++        }
++        final int sectionX = entity.moonrise$getSectionX();
++        final int sectionZ = entity.moonrise$getSectionZ();
++        if (sectionX == Integer.MIN_VALUE || sectionZ == Integer.MIN_VALUE || !(entity.level() instanceof ServerLevel world)) {
++            throw new IllegalStateException("Cannot remove an entity without its registered region during shutdown");
++        }
++        final var region = world.regioniser.getRegionAtSynchronised(sectionX, sectionZ);
++        if (region == null) {
++            throw new IllegalStateException("Cannot find the entity's registered region during shutdown");
++        }
++        this.runInRegion(region, () -> {
++            final RegionizedWorldData worldData = region.getData().getRegionizedData(world.worldRegionData);
++            if (worldData == null || !worldData.hasEntity(entity)) {
++                throw new IllegalStateException("Entity does not belong to its registered region during shutdown");
++            }
++            removal.run();
++        });
++    }
++
++    void runTickTask(final ServerLevel world, final int chunkX, final int chunkZ, final Runnable task) {
++        this.requireHaltedScheduler();
++        // A synchronized lookup distinguishes an absent region from an in-progress merge or split.
++        // Truly absent regions retain the shutdown thread's existing inline, null-context behavior.
++        this.runInRegion(world.regioniser.getRegionAtSynchronised(chunkX, chunkZ), task);
++    }
++
++    private void requireHaltedScheduler() {
++        if (!this.schedulerHalted) {
++            throw new IllegalStateException("Cannot borrow a region before the tick scheduler has terminated");
++        }
++    }
++
++    private void runInRegion(final ThreadedRegionizer.ThreadedRegion<TickRegions.TickRegionData, TickRegions.TickRegionSectionData> region,
++                             final Runnable action) {
++        final var previous = this.shuttingDown;
++        final boolean acquire = region != null && !this.borrowedRegions.contains(region);
++        if (acquire) {
++            // Chunk I/O and plugin tasks can still create regions after tick workers stop. Hold the existing
++            // region lease so that they defer migration until this operation has finished; never wait for it.
++            if (!region.tryMarkTicking(() -> false)) {
++                throw new IllegalStateException("Cannot borrow a busy or retired region during shutdown");
++            }
++            this.borrowedRegions.add(region);
++        }
++        try {
++            this.shuttingDown = region;
++            action.run();
++        } finally {
++            this.shuttingDown = null;
++            try {
++                if (acquire) {
++                    this.borrowedRegions.remove(this.borrowedRegions.size() - 1);
++                    region.markNotTicking();
++                }
++            } finally {
++                this.shuttingDown = previous;
++            }
++        }
++    }
++
+     // The region shutdown thread bypasses all tick thread checks, which will allow us to execute global saves
+     // it will not however let us perform arbitrary sync loads, arbitrary world state lookups simply because
+     // the data required to do that is regionised, and we can only access it when we OWN the region, and we do not.
+@@ -154,7 +237,7 @@ public final class RegionShutdownThread extends ca.spottedleaf.moonrise.common.u
+     public final void run() {
+         // await scheduler termination
+         LOGGER.info("Awaiting scheduler termination for 60s...");
+-        final boolean schedulerHalted = TickRegions.getScheduler().halt(true, TimeUnit.SECONDS.toNanos(60L));
++        final boolean schedulerHalted = this.schedulerHalted = TickRegions.getScheduler().halt(true, TimeUnit.SECONDS.toNanos(60L));
+         if (schedulerHalted) {
+             LOGGER.info("Scheduler halted");
+         } else {
+diff --git a/io/papermc/paper/threadedregions/RegionizedTaskQueue.java b/io/papermc/paper/threadedregions/RegionizedTaskQueue.java
+index d1a045d..9d167e5 100644
+--- a/io/papermc/paper/threadedregions/RegionizedTaskQueue.java
++++ b/io/papermc/paper/threadedregions/RegionizedTaskQueue.java
+@@ -79,6 +79,9 @@ public final class RegionizedTaskQueue {
+ 
+     public PrioritisedExecutor.PrioritisedTask queueOrExecuteTickTask(final ServerLevel world, final int chunkX, final int chunkZ,
+                                                                       final Runnable run, final Priority priority) {
++        if (RegionShutdownThread.tryRunTickTask(world, chunkX, chunkZ, run)) {
++            return null;
++        }
+         if (TickThread.isTickThreadFor(world, chunkX, chunkZ)) {
+             run.run();
+             return null;
+diff --git a/net/minecraft/world/entity/Entity.java b/net/minecraft/world/entity/Entity.java
+index 7b8d9cd..31a4237 100644
+--- a/net/minecraft/world/entity/Entity.java
++++ b/net/minecraft/world/entity/Entity.java
+@@ -6244,6 +6244,11 @@ public abstract class Entity
+     public final boolean hasNullCallback() {
+         return this.levelCallback == EntityInLevelCallback.NULL;
+     }
++
++    public final boolean hasInactiveLevelCallback() {
++        return this.levelCallback == EntityInLevelCallback.NULL
++            || this.levelCallback == ca.spottedleaf.moonrise.patches.chunk_system.level.entity.EntityLookup.NoOpCallback.INSTANCE;
++    }
+     // Folia end - region threading
+ 
+     public Entity.@Nullable RemovalReason getRemovalReason() {
