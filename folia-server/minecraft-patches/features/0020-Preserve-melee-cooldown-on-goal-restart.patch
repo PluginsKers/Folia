@@ -1,0 +1,33 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: PluginsKers <ikers@foxmail.com>
+Subject: [PATCH] fix: 保留近战目标重启前的攻击冷却
+
+diff --git a/net/minecraft/world/entity/ai/goal/MeleeAttackGoal.java b/net/minecraft/world/entity/ai/goal/MeleeAttackGoal.java
+index 4ac8b0f..8c176f9 100644
+--- a/net/minecraft/world/entity/ai/goal/MeleeAttackGoal.java
++++ b/net/minecraft/world/entity/ai/goal/MeleeAttackGoal.java
+@@ -18,6 +18,7 @@ public class MeleeAttackGoal extends Goal {
+     private double pathedTargetZ;
+     private int ticksUntilNextPathRecalculation;
+     private int ticksUntilNextAttack;
++    private int lastStopTick; // Folia - preserve melee cooldown across goal restarts
+     private final int attackInterval = 20;
+     private long lastCanUseCheck;
+     private static final long COOLDOWN_BETWEEN_CAN_USE_CHECKS = 20L;
+@@ -69,11 +70,15 @@ public class MeleeAttackGoal extends Goal {
+         this.mob.getNavigation().moveTo(this.path, this.speedModifier);
+         this.mob.setAggressive(true);
+         this.ticksUntilNextPathRecalculation = 0;
+-        this.ticksUntilNextAttack = 0;
++        // Folia start - preserve melee cooldown across goal restarts
++        final int idleTicks = Math.max(0, this.mob.tickCount - this.lastStopTick);
++        this.ticksUntilNextAttack = Math.max(0, this.ticksUntilNextAttack - this.adjustedTickDelay(idleTicks));
++        // Folia end - preserve melee cooldown across goal restarts
+     }
+ 
+     @Override
+     public void stop() {
++        this.lastStopTick = this.mob.tickCount; // Folia - preserve melee cooldown across goal restarts
+         LivingEntity target = this.mob.getTarget();
+         if (!EntitySelector.NO_CREATIVE_OR_SPECTATOR.test(target)) {
+             this.mob.setTarget(null);
