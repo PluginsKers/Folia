@@ -1,0 +1,76 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: PluginsKers <ikers@foxmail.com>
+Date: Wed, 14 Oct 2026 23:19:19 +0800
+Subject: [PATCH] fix: continue baby villager bed searches without synchronous POI reads
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+---
+ .../entity/ai/sensing/NearestBedSensor.java   | 35 +++++++++++--------
+ 1 file changed, 21 insertions(+), 14 deletions(-)
+
+diff --git a/net/minecraft/world/entity/ai/sensing/NearestBedSensor.java b/net/minecraft/world/entity/ai/sensing/NearestBedSensor.java
+index 55940fb..b813e80 100644
+--- a/net/minecraft/world/entity/ai/sensing/NearestBedSensor.java
++++ b/net/minecraft/world/entity/ai/sensing/NearestBedSensor.java
+@@ -26,6 +26,7 @@ public class NearestBedSensor extends Sensor<Mob> {
+     private final Long2LongMap batchCache = new Long2LongOpenHashMap();
+     private int triedCount;
+     private long lastUpdate;
++    private boolean searching;
+ 
+     public NearestBedSensor() {
+         super(20);
+@@ -38,7 +39,7 @@ public class NearestBedSensor extends Sensor<Mob> {
+ 
+     @Override
+     protected void doTick(final ServerLevel level, final Mob body) {
+-        if (body.isBaby()) {
++        if (body.isBaby() && !this.searching) {
+             this.triedCount = 0;
+             this.lastUpdate = level.getGameTime() + level.getRandom().nextInt(20);
+             PoiManager poiManager = level.getPoiManager();
+@@ -55,20 +56,26 @@ public class NearestBedSensor extends Sensor<Mob> {
+                 this.batchCache.put(key, this.lastUpdate + 40L);
+                 return true;
+             };
+-            Set<Pair<Holder<PoiType>, BlockPos>> pois = poiManager.findAllWithType(
+-                    e -> e.is(PoiTypes.HOME), cacheTest, body.blockPosition(), AcquirePoi.SCAN_RANGE, PoiManager.Occupancy.ANY
+-                )
+-                .collect(Collectors.toSet());
+-            Path path = AcquirePoi.findPathToPois(body, pois);
+-            if (path != null && path.canReach()) {
+-                BlockPos targetPos = path.getTarget();
+-                Optional<Holder<PoiType>> type = poiManager.getType(targetPos);
+-                if (type.isPresent()) {
+-                    body.getBrain().setMemory(MemoryModuleType.NEAREST_BED, targetPos);
++            this.searching = true;
++            var search = new ca.spottedleaf.moonrise.patches.poi_lookup.PoiAccess.AnySearch(
++                poiManager, e -> e.is(PoiTypes.HOME), (type, pos) -> cacheTest.test(pos),
++                body.blockPosition(), AcquirePoi.SCAN_RANGE, (double)AcquirePoi.SCAN_RANGE * AcquirePoi.SCAN_RANGE,
++                PoiManager.Occupancy.ANY, Integer.MAX_VALUE);
++            ca.spottedleaf.moonrise.patches.poi_lookup.PoiSearchTask.start(body, search, Mob::isBaby, records -> {
++                Set<Pair<Holder<PoiType>, BlockPos>> pois = records.stream()
++                    .filter(record -> poiManager.getType(record.getPos()).filter(record.getPoiType()::equals).isPresent())
++                    .map(record -> Pair.of(record.getPoiType(), record.getPos())).collect(Collectors.toSet());
++                Path path = AcquirePoi.findPathToPois(body, pois);
++                if (path != null && path.canReach()) {
++                    BlockPos targetPos = path.getTarget();
++                    Optional<Holder<PoiType>> type = poiManager.getType(targetPos);
++                    if (type.isPresent()) {
++                        body.getBrain().setMemory(MemoryModuleType.NEAREST_BED, targetPos);
++                    }
++                } else if (this.triedCount < 5) {
++                    this.batchCache.long2LongEntrySet().removeIf(entry -> entry.getLongValue() < this.lastUpdate);
+                 }
+-            } else if (this.triedCount < 5) {
+-                this.batchCache.long2LongEntrySet().removeIf(entry -> entry.getLongValue() < this.lastUpdate);
+-            }
++            }, () -> this.searching = false);
+         }
+     }
+ }
+-- 
+2.53.0.windows.1
+
