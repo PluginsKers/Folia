@@ -1,0 +1,25 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: PluginsKers <ikers@foxmail.com>
+Date: Wed, 14 Oct 2026 17:59:58 +0800
+Subject: [PATCH] feat: implement asynchronous player data saves
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+
+diff --git a/src/main/java/org/bukkit/craftbukkit/entity/CraftPlayer.java b/src/main/java/org/bukkit/craftbukkit/entity/CraftPlayer.java
+index e20a66e56f2e4520b2708d6ebc377392e4362816..ce30f1c1428d683127f81f6a956539d27d91a44b 100644
+--- a/src/main/java/org/bukkit/craftbukkit/entity/CraftPlayer.java
++++ b/src/main/java/org/bukkit/craftbukkit/entity/CraftPlayer.java
+@@ -1390,6 +1390,11 @@ public class CraftPlayer extends CraftHumanEntity implements Player, PluginMessa
+         this.server.getHandle().playerIo.save(this.getHandle());
+     }
+ 
++    @Override
++    public java.util.concurrent.CompletableFuture<Void> saveDataAsync() {
++        return this.server.getHandle().playerIo.saveAsync(this.getHandle());
++    }
++
+     @Deprecated
+     @Override
+     public void updateInventory() {
