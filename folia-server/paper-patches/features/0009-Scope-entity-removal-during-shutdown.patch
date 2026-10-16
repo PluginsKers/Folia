@@ -1,0 +1,49 @@
+From 635729586ccc47bdb1d84ba8687559a9d5258864 Mon Sep 17 00:00:00 2001
+From: PluginsKers <ikers@foxmail.com>
+Date: Fri, 16 Oct 2026 09:21:48 +0800
+Subject: [PATCH] Restore region context for entity removal during shutdown
+
+---
+ .../org/bukkit/craftbukkit/entity/CraftEntity.java     | 10 +++++++++-
+ .../org/bukkit/craftbukkit/entity/CraftVillager.java   |  4 ++--
+ 2 files changed, 11 insertions(+), 3 deletions(-)
+
+diff --git a/src/main/java/org/bukkit/craftbukkit/entity/CraftEntity.java b/src/main/java/org/bukkit/craftbukkit/entity/CraftEntity.java
+index d5bbdc041..fa6c39650 100644
+--- a/src/main/java/org/bukkit/craftbukkit/entity/CraftEntity.java
++++ b/src/main/java/org/bukkit/craftbukkit/entity/CraftEntity.java
+@@ -487,8 +487,16 @@ public abstract class CraftEntity implements org.bukkit.entity.Entity {
+ 
+     @Override
+     public void remove() {
++        if (io.papermc.paper.threadedregions.RegionShutdownThread.tryRunEntityRemoval(this.entity, this::removeInternal)) {
++            return;
++        }
++        this.removeInternal();
++    }
++
++    protected void removeInternal() {
++        final Entity handle = this.getHandle();
+         this.entity.pluginRemoved = true;
+-        this.entity.discard(this.getHandle().generation ? null : EntityRemoveEvent.Cause.PLUGIN);
++        handle.discard(handle.generation ? null : EntityRemoveEvent.Cause.PLUGIN);
+     }
+ 
+     @Override
+diff --git a/src/main/java/org/bukkit/craftbukkit/entity/CraftVillager.java b/src/main/java/org/bukkit/craftbukkit/entity/CraftVillager.java
+index 1ad99732f..eebb439dc 100644
+--- a/src/main/java/org/bukkit/craftbukkit/entity/CraftVillager.java
++++ b/src/main/java/org/bukkit/craftbukkit/entity/CraftVillager.java
+@@ -41,10 +41,10 @@ public class CraftVillager extends CraftAbstractVillager implements Villager {
+     }
+ 
+     @Override
+-    public void remove() {
++    protected void removeInternal() {
+         this.getHandle().releaseAllPois();
+ 
+-        super.remove();
++        super.removeInternal();
+     }
+ 
+     @Override
