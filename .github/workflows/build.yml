@@ -48,8 +48,8 @@ jobs:
           git config --global user.name "GitHub Actions"
           ./gradlew --no-daemon applyAllPatches --stacktrace
 
-      - name: Build and check
-        run: ./gradlew --no-daemon build createPaperclipJar --stacktrace
+      - name: Build Paperclip
+        run: ./gradlew --no-daemon assemble createPaperclipJar --stacktrace
 
       - name: Collect Paperclip and checksum
         shell: bash

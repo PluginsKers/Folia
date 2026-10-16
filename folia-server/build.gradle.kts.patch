@@ -1,28 +1,26 @@
 --- a/paper-server/build.gradle.kts
 +++ b/paper-server/build.gradle.kts
-@@ -20,8 +_,21 @@
+@@ -20,7 +_,19 @@
  
  paperweight {
      minecraftVersion = providers.gradleProperty("mcVersion")
 +    filterPatches = false
      gitFilePatches = false
- 
++
 +    val fork = forks.register("folia") {
 +        upstream.patchDir("paperServer") {
 +            upstreamPath = "paper-server"
-+            excludes = setOf("src/minecraft", "patches", "build.gradle.kts")
++            excludes = setOf("src/minecraft", "src/test", "patches", "build.gradle.kts")
 +            patchesDir = rootDirectory.dir("folia-server/paper-patches")
 +            outputDir = rootDirectory.dir("paper-server")
 +        }
 +    }
 +
 +    activeFork = fork
-+
-+
+ 
      updatingMinecraft {
          //oldPaperCommit = "e5fe71723e2ffde7cc9fafc085ac3bb73e63175e"
-     }
-@@ -86,7 +_,19 @@
+@@ -86,7 +_,15 @@
      }
  }
  
@@ -32,10 +30,6 @@
 +        java { srcDir("../paper-server/src/main/java") }
 +        resources { srcDir("../paper-server/src/main/resources") }
 +    }
-+    test {
-+        java { srcDir("../paper-server/src/test/java") }
-+        resources { srcDir("../paper-server/src/test/resources") }
-+    }
 +}
 +val log4jPlugins = sourceSets.create("log4jPlugins") {
 +    java { srcDir("../paper-server/src/log4jPlugins/java") }
@@ -43,9 +37,21 @@
  configurations.named(log4jPlugins.compileClasspathConfigurationName) {
      extendsFrom(configurations.compileClasspath.get())
  }
-@@ -109,11 +_,12 @@
+@@ -97,23 +_,13 @@
+     extendsFrom(configurations.getByName(sourceSets.main.get().runtimeElementsConfigurationName))
  }
  
+-// Configure mockito agent that is needed in newer java versions
+-val mockitoAgent = configurations.register("mockitoAgent")
+-abstract class MockitoAgentProvider : CommandLineArgumentProvider {
+-    @get:CompileClasspath
+-    abstract val fileCollection: ConfigurableFileCollection
+-
+-    override fun asArguments(): Iterable<String> {
+-        return listOf("-javaagent:" + fileCollection.files.single().absolutePath)
+-    }
+-}
+-
  dependencies {
 -    implementation(project(":paper-api"))
 +    implementation(project(":folia-api"))
@@ -57,6 +63,23 @@
      implementation("org.jline:jline-terminal-ffm:4.4.6")
      implementation("net.minecrell:terminalconsoleappender:1.3.0")
      implementation("net.kyori:adventure-text-serializer-ansi")
+@@ -145,16 +_,6 @@
+     implementation("com.googlecode.json-simple:json-simple:1.1.1") { // change to runtimeOnly once Timings is removed
+         isTransitive = false // includes junit
+     }
+-
+-    testImplementation("io.github.classgraph:classgraph:4.8.184") // For mob goal test
+-    testRuntimeOnly("org.junit.platform:junit-platform-launcher:6.0.3")
+-    testImplementation("org.junit.jupiter:junit-jupiter:6.0.3")
+-    testImplementation("org.junit.platform:junit-platform-suite-engine:6.0.3")
+-    testImplementation("org.hamcrest:hamcrest:2.2")
+-    testImplementation("org.mockito:mockito-core:5.22.0")
+-    mockitoAgent("org.mockito:mockito-core:5.22.0") { isTransitive = false } // Configure mockito agent that is needed in newer java versions
+-    testImplementation("org.ow2.asm:asm-tree:9.9.1")
+-    testImplementation("org.junit-pioneer:junit-pioneer:2.3.0") // CartesianTest
+ 
+     // Spark
+     implementation("me.lucko:spark-api:0.1-20240720.200737-2")
 @@ -173,14 +_,14 @@
          val gitBranch = git.exec(providers, "rev-parse", "--abbrev-ref", "HEAD").get().trim()
          attributes(
@@ -76,7 +99,43 @@
              "Build-Number" to (build ?: ""),
              "Build-Time" to buildTime.toString(),
              "Git-Branch" to gitBranch,
-@@ -258,7 +_,7 @@
+@@ -190,11 +_,6 @@
+             attributes("$tld/bukkit", "Sealed" to true)
+         }
+     }
+-}
+-
+-// Compile tests with -parameters for better junit parameterized test names
+-tasks.compileTestJava {
+-    options.compilerArgs.add("-parameters")
+ }
+ 
+ tasks.named<JavaCompile>(log4jPlugins.compileJavaTaskName) {
+@@ -234,31 +_,13 @@
+     })
+ }
+ 
+-tasks.test {
+-    include("**/**TestSuite.class")
+-    workingDir = temporaryDir
+-    useJUnitPlatform {
+-        forkEvery = 1
+-        excludeTags("Slow")
+-    }
+-
+-    // Configure mockito agent that is needed in newer java versions
+-    val provider = objects.newInstance<MockitoAgentProvider>()
+-    provider.fileCollection.from(mockitoAgent)
+-    jvmArgumentProviders.add(provider)
+-
+-    // Hides repeated jline/joml warnings due to forking
+-    jvmArgs("--enable-native-access=ALL-UNNAMED")
+-    systemProperty("joml.nounsafe", true)
+-}
+-
+ tasks.withType<io.papermc.paperweight.tasks.CreateBundlerJar>().configureEach {
+     extraManifestMainAttributes = mapOf(
+         "Enable-Native-Access" to "ALL-UNNAMED",
      )
  }
  

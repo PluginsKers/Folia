@@ -4106,21 +4106,3 @@ index 7ccb1f3f4a91aeb1295594a4645a74a9e9e697dc..6056f98f5b28ff2d4a7c49c79edb15c1
      public int maxTntTicksPerTick;
      private void maxTntPerTick() {
          if (SpigotConfig.version < 7) {
-diff --git a/src/test/java/io/papermc/paper/plugin/TestPluginMeta.java b/src/test/java/io/papermc/paper/plugin/TestPluginMeta.java
-index ba271c35eb2804f94cfc893bf94affb9ae13d3ba..db9285c2ff0c805f5d9564b6e8520c33ea5bb65a 100644
---- a/src/test/java/io/papermc/paper/plugin/TestPluginMeta.java
-+++ b/src/test/java/io/papermc/paper/plugin/TestPluginMeta.java
-@@ -20,6 +20,13 @@ public class TestPluginMeta implements PluginMeta {
-         this.identifier = identifier;
-     }
- 
-+    // Folia start - region threading
-+    @Override
-+    public boolean isFoliaSupported() {
-+        return true;
-+    }
-+    // Folia end - region threading
-+
-     @Override
-     public @NotNull String getName() {
-         return this.identifier;
