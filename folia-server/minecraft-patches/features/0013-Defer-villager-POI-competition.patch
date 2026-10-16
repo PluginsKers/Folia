@@ -1,0 +1,23 @@
+From ce1a56cfeacd746bf584ce0fa6e30247c163d948 Mon Sep 17 00:00:00 2001
+From: PluginsKers <ikers@foxmail.com>
+Date: Fri, 16 Oct 2026 09:19:49 +0800
+Subject: [PATCH] fix: avoid synchronous POI reads during villager competition
+
+---
+ net/minecraft/world/entity/ai/behavior/PoiCompetitorScan.java | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/net/minecraft/world/entity/ai/behavior/PoiCompetitorScan.java b/net/minecraft/world/entity/ai/behavior/PoiCompetitorScan.java
+index 53131c1..8b36914 100644
+--- a/net/minecraft/world/entity/ai/behavior/PoiCompetitorScan.java
++++ b/net/minecraft/world/entity/ai/behavior/PoiCompetitorScan.java
+@@ -25,7 +25,8 @@ public class PoiCompetitorScan {
+                         }
+                         // Folia end - region threading
+                         level.getPoiManager()
+-                            .getType(pos.pos())
++                            .get(net.minecraft.core.SectionPos.asLong(pos.pos())) // Folia - defer competition until POI data is loaded
++                            .flatMap(section -> section.getType(pos.pos()))
+                             .ifPresent(
+                                 // Paper start - Improve performance of PoiCompetitorScan by unrolling stream
+                                 // The previous logic used Stream#reduce to simulate a form of single-iteration bubble sort
