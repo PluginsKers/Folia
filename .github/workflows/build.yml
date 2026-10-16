@@ -29,6 +29,12 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/')
         run: git merge-base --is-ancestor "$GITHUB_SHA" origin/kers/26.3.x
 
+      - name: Set build metadata
+        shell: bash
+        run: |
+          echo "BUILD_NUMBER=$GITHUB_RUN_NUMBER" >> "$GITHUB_ENV"
+          echo "BUILD_STARTED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_ENV"
+
       - uses: actions/setup-java@v6
         with:
           distribution: temurin
@@ -51,10 +57,12 @@ jobs:
           shopt -s nullglob
           jars=(folia-server/build/libs/folia-paperclip-*.jar)
           test "${#jars[@]}" -eq 1
+          mc_version="$(sed -n 's/^mcVersion=//p' gradle.properties)"
+          file_name="folia-${mc_version}-${BUILD_NUMBER}.jar"
           mkdir -p dist
-          cp "${jars[0]}" dist/folia.jar
+          cp "${jars[0]}" "dist/$file_name"
           cd dist
-          sha256sum folia.jar > SHA256SUMS
+          sha256sum "$file_name" > SHA256SUMS
 
       - uses: actions/upload-artifact@v7
         with:
