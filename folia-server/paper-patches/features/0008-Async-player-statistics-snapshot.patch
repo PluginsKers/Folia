@@ -1,0 +1,103 @@
+From b576f49dadf09be95b344dcbce94c3e51434c452 Mon Sep 17 00:00:00 2001
+From: PluginsKers <ikers@foxmail.com>
+Date: Fri, 16 Oct 2026 09:20:46 +0800
+Subject: [PATCH] Expose asynchronous player statistic snapshots
+
+---
+ .../HorriblePlayerLoginEventHack.java         |  2 +-
+ .../craftbukkit/CraftOfflinePlayer.java       |  4 ++
+ .../bukkit/craftbukkit/CraftStatistic.java    | 37 +++++++++++++++++++
+ .../craftbukkit/entity/CraftPlayer.java       |  4 ++
+ 4 files changed, 46 insertions(+), 1 deletion(-)
+
+diff --git a/src/main/java/io/papermc/paper/connection/HorriblePlayerLoginEventHack.java b/src/main/java/io/papermc/paper/connection/HorriblePlayerLoginEventHack.java
+index e6511bddc..5c445efd4 100644
+--- a/src/main/java/io/papermc/paper/connection/HorriblePlayerLoginEventHack.java
++++ b/src/main/java/io/papermc/paper/connection/HorriblePlayerLoginEventHack.java
+@@ -79,7 +79,7 @@ public class HorriblePlayerLoginEventHack {
+         if (connection.savedPlayerForLegacyEvents != null) {
+             player = connection.savedPlayerForLegacyEvents;
+         } else {
+-            ServerPlayer serverPlayer = new ServerPlayer(server, server.overworld(), profile, ClientInformation.createDefault());
++            ServerPlayer serverPlayer = new ServerPlayer(server, server.overworld(), profile, ClientInformation.createDefault(), java.util.Objects.requireNonNull(connection.loadedStatistics));
+             connection.savedPlayerForLegacyEvents = serverPlayer;
+             player = serverPlayer;
+         }
+diff --git a/src/main/java/org/bukkit/craftbukkit/CraftOfflinePlayer.java b/src/main/java/org/bukkit/craftbukkit/CraftOfflinePlayer.java
+index 1aa8f1e0a..734f6cccf 100644
+--- a/src/main/java/org/bukkit/craftbukkit/CraftOfflinePlayer.java
++++ b/src/main/java/org/bukkit/craftbukkit/CraftOfflinePlayer.java
+@@ -384,6 +384,10 @@ public class CraftOfflinePlayer implements OfflinePlayer, ConfigurationSerializa
+             .orElse(null);
+     }
+ 
++    @Override
++    public java.util.concurrent.CompletableFuture<java.util.Map<Statistic, Integer>> getStatisticsAsync(java.util.Set<Statistic> statistics) {
++        return CraftStatistic.getStatisticsAsync(this.server, this.nameAndId.toUncompletedGameProfile(), statistics);
++    }
+     private ServerStatsCounter getStatisticManager() {
+         return this.server.getHandle().getPlayerStats(this.nameAndId.toUncompletedGameProfile());
+     }
+diff --git a/src/main/java/org/bukkit/craftbukkit/CraftStatistic.java b/src/main/java/org/bukkit/craftbukkit/CraftStatistic.java
+index d1a45c200..c2f30b1e5 100644
+--- a/src/main/java/org/bukkit/craftbukkit/CraftStatistic.java
++++ b/src/main/java/org/bukkit/craftbukkit/CraftStatistic.java
+@@ -144,6 +144,43 @@ public enum CraftStatistic {
+         return statistics.get(nmsKey);
+     }
+ 
++    public static java.util.concurrent.CompletableFuture<java.util.Map<Statistic, Integer>> getStatisticsAsync(
++        CraftServer server, com.mojang.authlib.GameProfile profile, java.util.Set<Statistic> statistics
++    ) {
++        java.util.Set<Statistic> requested = java.util.Set.copyOf(statistics);
++        requested.forEach(statistic -> Preconditions.checkArgument(statistic.getType() == Type.UNTYPED, "This method only accepts untyped statistics"));
++        if (requested.isEmpty()) return java.util.concurrent.CompletableFuture.completedFuture(java.util.Map.of());
++        java.util.concurrent.CompletableFuture<java.util.Map<Statistic, Integer>> result = new java.util.concurrent.CompletableFuture<>();
++        Runnable readOffline = () -> server.getHandle().getPlayerStatsAsync(profile, false).whenComplete((counter, failure) -> {
++            if (failure != null) result.completeExceptionally(failure);
++            else {
++                try {
++                    result.complete(snapshot(counter, requested));
++                } catch (Exception error) {
++                    result.completeExceptionally(error);
++                }
++            }
++        });
++        ServerPlayer online = server.getHandle().getPlayer(profile.id());
++        if (online == null) {
++            readOffline.run();
++        } else if (!online.getBukkitEntity().taskScheduler.schedule(entity -> {
++            try {
++                result.complete(snapshot(((ServerPlayer) entity).getStats(), requested));
++            } catch (Exception failure) {
++                result.completeExceptionally(failure);
++            }
++        }, entity -> readOffline.run(), 1L)) {
++            readOffline.run();
++        }
++        return result;
++    }
++
++    private static java.util.Map<Statistic, Integer> snapshot(ServerStatsCounter counter, java.util.Set<Statistic> requested) {
++        java.util.Map<Statistic, Integer> values = new java.util.EnumMap<>(Statistic.class);
++        requested.forEach(statistic -> values.put(statistic, getStatistic(counter, statistic)));
++        return java.util.Map.copyOf(values);
++    }
+     public static net.minecraft.stats.Stat getNMSStatistic(org.bukkit.Statistic bukkit) {
+         Preconditions.checkArgument(bukkit.getType() == Statistic.Type.UNTYPED, "This method only accepts untyped statistics");
+ 
+diff --git a/src/main/java/org/bukkit/craftbukkit/entity/CraftPlayer.java b/src/main/java/org/bukkit/craftbukkit/entity/CraftPlayer.java
+index 04b47c515..060a40c1a 100644
+--- a/src/main/java/org/bukkit/craftbukkit/entity/CraftPlayer.java
++++ b/src/main/java/org/bukkit/craftbukkit/entity/CraftPlayer.java
+@@ -1489,6 +1489,10 @@ public class CraftPlayer extends CraftHumanEntity implements Player, PluginMessa
+         CraftStatistic.decrementStatistic(this.getHandle().getStats(), statistic, this.getHandle());
+     }
+ 
++    @Override
++    public java.util.concurrent.CompletableFuture<java.util.Map<Statistic, Integer>> getStatisticsAsync(java.util.Set<Statistic> statistics) {
++        return CraftStatistic.getStatisticsAsync(this.server, ((ServerPlayer) this.getHandleRaw()).getGameProfile(), statistics);
++    }
+     @Override
+     public int getStatistic(Statistic statistic) {
+         return CraftStatistic.getStatistic(this.getHandle().getStats(), statistic);
