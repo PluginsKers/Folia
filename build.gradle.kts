@@ -1,5 +1,3 @@
-import org.gradle.api.tasks.testing.logging.TestExceptionFormat
-import org.gradle.api.tasks.testing.logging.TestLogEvent
 import io.papermc.paperweight.tasks.RebuildGitPatches
 
 plugins {
@@ -29,13 +27,13 @@ paperweight {
         }
         patchDir("paperApi") {
             upstreamPath = "paper-api"
-            excludes = setOf("build.gradle.kts")
+            excludes = setOf("build.gradle.kts", "src/test")
             patchesDir = file("folia-api/paper-patches")
             outputDir = file("paper-api")
         }
         patchDir("paperCheckstyle") {
             upstreamPath = "paper-checkstyle"
-            excludes = setOf("build.gradle.kts")
+            excludes = setOf("build.gradle.kts", "src/test", "src/testData")
             patchesDir = file("folia-checkstyle/paper-patches")
             outputDir = file("paper-checkstyle")
         }
@@ -64,10 +62,6 @@ subprojects {
         maven(paperMavenPublicUrl)
     }
 
-    dependencies {
-        "testRuntimeOnly"("org.junit.platform:junit-platform-launcher")
-    }
-
     tasks.withType<AbstractArchiveTask>().configureEach {
         isPreserveFileTimestamps = false
         isReproducibleFileOrder = true
@@ -83,14 +77,6 @@ subprojects {
     tasks.withType<ProcessResources>().configureEach  {
         filteringCharset = Charsets.UTF_8.name()
     }
-    tasks.withType<Test>().configureEach  {
-        testLogging {
-            showStackTraces = true
-            exceptionFormat = TestExceptionFormat.FULL
-            events(TestLogEvent.STANDARD_OUT)
-        }
-    }
-
     extensions.configure<PublishingExtension> {
         repositories {
             maven("https://artifactory.papermc.io/artifactory/releases/") {

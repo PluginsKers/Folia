@@ -13,20 +13,59 @@
  }
  
  val annotationsVersion = "26.1.0"
-@@ -103,10 +_,10 @@
-     testRuntimeOnly("org.junit.platform:junit-platform-launcher:6.0.3")
- 
-     // checkstyle
--    checkstyle(project(":paper-checkstyle"))
-+    checkstyle(project(":folia-checkstyle"))
+@@ -38,17 +_,6 @@
+         attribute(Bundling.BUNDLING_ATTRIBUTE, objects.named(Bundling.EXTERNAL))
+         attribute(DocsType.DOCS_TYPE_ATTRIBUTE, objects.named(DocsType.SOURCES))
+         attribute(Usage.USAGE_ATTRIBUTE, objects.named(Usage.JAVA_RUNTIME))
+-    }
+-}
+-
+-// Configure mockito agent that is needed in newer Java versions
+-val mockitoAgent = configurations.register("mockitoAgent")
+-abstract class MockitoAgentProvider : CommandLineArgumentProvider {
+-    @get:CompileClasspath
+-    abstract val fileCollection: ConfigurableFileCollection
+-
+-    override fun asArguments(): Iterable<String> {
+-        return listOf("-javaagent:" + fileCollection.files.single().absolutePath)
+     }
  }
  
+@@ -84,29 +_,18 @@
+     // Annotations - Slowly migrate to jspecify
+     val annotations = "org.jetbrains:annotations:$annotationsVersion"
+     compileOnly(annotations)
+-    testCompileOnly(annotations)
+     javadocSourcepath(annotations) // For adventure-api module requirements
+ 
+     val checkerQual = "org.checkerframework:checker-qual:4.2.3"
+     compileOnlyApi(checkerQual)
+-    testCompileOnly(checkerQual)
+ 
+     apiAndDocs("org.jspecify:jspecify:1.0.0")
+ 
+-    // Test dependencies
+-    testImplementation("org.apache.commons:commons-lang3:3.20.0")
+-    testImplementation("org.junit.jupiter:junit-jupiter:6.0.3")
+-    testImplementation("org.hamcrest:hamcrest:2.2")
+-    testImplementation("org.mockito:mockito-core:5.22.0")
+-    testImplementation("org.ow2.asm:asm-tree:9.9.1")
+-    mockitoAgent("org.mockito:mockito-core:5.22.0") { isTransitive = false } // configure mockito agent that is needed in newer java versions
+-    testRuntimeOnly("org.junit.platform:junit-platform-launcher:6.0.3")
+-
+     // checkstyle
+-    checkstyle(project(":paper-checkstyle"))
+-}
+-
 -val generatedDir: java.nio.file.Path = layout.projectDirectory.dir("src/generated/java").asFile.toPath()
++    checkstyle(project(":folia-checkstyle"))
++}
++
 +val generatedDir: java.nio.file.Path = rootProject.layout.projectDirectory.dir("paper-api/src/generated/java").asFile.toPath()
  idea {
      module {
          generatedSourceDirs.add(generatedDir.toFile())
-@@ -116,6 +_,18 @@
+@@ -116,6 +_,10 @@
      main {
          java {
              srcDir(generatedDir)
@@ -34,14 +73,6 @@
 +        }
 +        resources {
 +            srcDir(file("../paper-api/src/main/resources"))
-+        }
-+    }
-+    test {
-+        java {
-+            srcDir(file("../paper-api/src/test/java"))
-+        }
-+        resources {
-+            srcDir(file("../paper-api/src/test/resources"))
          }
      }
  }
@@ -54,7 +85,7 @@
      options.use()
      options.isDocFilesSubDirs = true
      options.links(
-@@ -225,11 +_,11 @@
+@@ -225,30 +_,16 @@
      }
  
      // workaround for https://github.com/gradle/gradle/issues/4046
@@ -68,3 +99,22 @@
                  include("**/doc-files/**")
              }
              into("build/docs/javadoc")
+         }
+     }
+-}
+-
+-tasks.test {
+-    useJUnitPlatform()
+-
+-    // configure mockito agent that is needed in newer java versions
+-    val provider = objects.newInstance<MockitoAgentProvider>()
+-    provider.fileCollection.from(mockitoAgent)
+-    jvmArgumentProviders.add(provider)
+-}
+-
+-// Compile tests with -parameters for better junit parameterized test names
+-tasks.compileTestJava {
+-    options.compilerArgs.add("-parameters")
+ }
+ 
+ val scanJarForBadCalls = tasks.register<io.papermc.paperweight.tasks.ScanJarForBadCalls>("scanJarForBadCalls") {
