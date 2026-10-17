@@ -1,0 +1,33 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: PluginsKers <ikers@foxmail.com>
+Subject: [PATCH] fix: preserve loaded-only ray tracing
+
+diff --git a/net/minecraft/world/level/Level.java b/net/minecraft/world/level/Level.java
+--- a/net/minecraft/world/level/Level.java
++++ b/net/minecraft/world/level/Level.java
+@@ -424,10 +424,23 @@ public abstract class Level implements LevelAccessor, AutoCloseable, ca.spottedleaf
+ 
+             if ((chunkDiff | chunkYDiff) != 0) {
+                 if (chunkDiff != 0) {
+-                    lastChunk = level.getChunk(newChunkX, newChunkZ).getSections();
++                    lastChunk = null;
+                 }
+                 final int sectionY = newChunkY - minSection;
+-                lastSection = sectionY >= 0 && sectionY < lastChunk.length ? lastChunk[sectionY].getStates() : null;
++                // Folia start - preserve loaded-only ray tracing, including air outside the build height
++                if (sectionY < 0 || sectionY >= level.getSectionsCount()) {
++                    lastSection = null;
++                } else {
++                    if (lastChunk == null) {
++                        final net.minecraft.world.level.chunk.LevelChunk chunk = level.getChunkIfLoaded(newChunkX, newChunkZ);
++                        if (chunk == null) {
++                            return miss(clipContext);
++                        }
++                        lastChunk = chunk.getSections();
++                    }
++                    lastSection = lastChunk[sectionY].getStates();
++                }
++                // Folia end - preserve loaded-only ray tracing
+ 
+                 lastChunkX = newChunkX;
+                 lastChunkY = newChunkY;
