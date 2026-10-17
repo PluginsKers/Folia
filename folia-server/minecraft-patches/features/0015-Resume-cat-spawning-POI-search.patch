@@ -5,22 +5,22 @@ Subject: [PATCH] fix: continue cat POI searches and close their leases before
  shutdown
 
 ---
- .../patches/poi_lookup/PoiSearchSession.java  | 68 ++++++++++++++++
+ .../patches/poi_lookup/PoiSearchSession.java  | 83 ++++++++++++++++++++
  .../patches/poi_lookup/PoiSearchTask.java     | 58 ++------------
  .../threadedregions/RegionShutdownThread.java | 19 +++++
  .../threadedregions/RegionizedWorldData.java  | 23 +++++-
  .../paper/threadedregions/TickRegions.java    |  3 +-
  net/minecraft/server/level/ServerLevel.java   |  1 +
  .../world/entity/npc/CatSpawner.java          | 77 +++++++++++++++++--
- 7 files changed, 188 insertions(+), 61 deletions(-)
+ 7 files changed, 203 insertions(+), 61 deletions(-)
  create mode 100644 ca/spottedleaf/moonrise/patches/poi_lookup/PoiSearchSession.java
 
 diff --git a/ca/spottedleaf/moonrise/patches/poi_lookup/PoiSearchSession.java b/ca/spottedleaf/moonrise/patches/poi_lookup/PoiSearchSession.java
 new file mode 100644
-index 0000000..9dc78b7
+index 0000000..1506c6c
 --- /dev/null
 +++ b/ca/spottedleaf/moonrise/patches/poi_lookup/PoiSearchSession.java
-@@ -0,0 +1,68 @@
+@@ -0,0 +1,83 @@
 +package ca.spottedleaf.moonrise.patches.poi_lookup;
 +
 +import ca.spottedleaf.moonrise.common.util.CoordinateUtils;
@@ -28,6 +28,7 @@ index 0000000..9dc78b7
 +import ca.spottedleaf.moonrise.patches.chunk_system.level.poi.PoiChunk;
 +import ca.spottedleaf.moonrise.patches.chunk_system.scheduling.ChunkHolderManager;
 +import it.unimi.dsi.fastutil.longs.Long2ObjectOpenHashMap;
++import it.unimi.dsi.fastutil.longs.LongOpenHashSet;
 +import java.util.Optional;
 +import java.util.concurrent.atomic.AtomicBoolean;
 +import net.minecraft.server.level.ServerLevel;
@@ -50,16 +51,30 @@ index 0000000..9dc78b7
 +        for (final long key : this.leases.keySet()) {
 +            if (!TickThread.isTickThreadFor(this.level, CoordinateUtils.getChunkX(key), CoordinateUtils.getChunkZ(key))) throw new LostOwnership();
 +        }
-+        return search.advance(this::section);
++        final LongOpenHashSet borrowed = new LongOpenHashSet();
++        final boolean complete = search.advance(key -> this.section(key, borrowed));
++        if (!complete) {
++            // POI unloading runs on the owner. Pin borrowed columns only when the cursor outlives this tick.
++            for (final long key : borrowed) {
++                this.leases.put(key, this.manager.acquirePoiChunk(CoordinateUtils.getChunkX(key), CoordinateUtils.getChunkZ(key)));
++            }
++        }
++        return complete;
 +    }
 +
-+    private Optional<PoiSection> section(final long sectionKey) {
++    private Optional<PoiSection> section(final long sectionKey, final LongOpenHashSet borrowed) {
 +        final int x = CoordinateUtils.getChunkSectionX(sectionKey);
 +        final int z = CoordinateUtils.getChunkSectionZ(sectionKey);
 +        if (!TickThread.isTickThreadFor(this.level, x, z)) throw new LostOwnership();
 +        final long chunkKey = CoordinateUtils.getChunkKey(x, z);
 +        ChunkHolderManager.PoiChunkLease lease = this.leases.get(chunkKey);
 +        if (lease == null) {
++            final PoiChunk loaded = this.manager.getPoiChunkIfLoaded(x, z, false);
++            if (loaded != null) {
++                borrowed.add(chunkKey);
++                loaded.load();
++                return loaded.getSectionForVanilla(CoordinateUtils.getChunkSectionY(sectionKey));
++            }
 +            lease = this.manager.acquirePoiChunk(x, z);
 +            this.leases.put(chunkKey, lease);
 +        }
@@ -325,7 +340,7 @@ index 3d352bb..8f2ceb7 100644
              profiler.push("world border");
              //this.getWorldBorder().tick(); // Folia - regionised ticking
 diff --git a/net/minecraft/world/entity/npc/CatSpawner.java b/net/minecraft/world/entity/npc/CatSpawner.java
-index 0e46f86..b36ea48 100644
+index 0e46f86..1fc33d4 100644
 --- a/net/minecraft/world/entity/npc/CatSpawner.java
 +++ b/net/minecraft/world/entity/npc/CatSpawner.java
 @@ -1,6 +1,11 @@
@@ -390,7 +405,7 @@ index 0e46f86..b36ea48 100644
              }
 +            if (!attempt.isValid(level)) return;
 +            // A previously visited section may have changed while another column was loading.
-+            // The full first traversal still holds every lease; this second snapshot cannot start disk IO.
++            // Suspended columns remain leased; new columns stay loaded throughout this owner tick.
 +            PoiAccess.AnySearch current = attempt.search(level);
 +            if (!attempt.session.advance(current)) throw new IllegalStateException("Leased POI data became unavailable");
 +            if (current.result().size() > 4
