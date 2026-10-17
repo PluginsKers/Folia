@@ -1,0 +1,21 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: PluginsKers <ikers@foxmail.com>
+Subject: [PATCH] perf: skip empty enchantment tick effects
+
+diff --git a/net/minecraft/world/item/enchantment/Enchantment.java b/net/minecraft/world/item/enchantment/Enchantment.java
+--- a/net/minecraft/world/item/enchantment/Enchantment.java
++++ b/net/minecraft/world/item/enchantment/Enchantment.java
+@@ -397,6 +397,12 @@ public record Enchantment(Component description, Enchantment.EnchantmentDefinition
+     public void tick(final ServerLevel serverLevel, final int enchantmentLevel, final EnchantedItemInUse item, final Entity entity) {
++        // Folia start - avoid contexts for empty tick effects
++        List<ConditionalEffect<EnchantmentEntityEffect>> tickEffects = this.getEffects(EnchantmentEffectComponents.TICK);
++        if (tickEffects.isEmpty()) {
++            return;
++        }
++        // Folia end - avoid contexts for empty tick effects
+         applyEffects(
+-            this.getEffects(EnchantmentEffectComponents.TICK),
++            tickEffects,
+             entityContext(serverLevel, enchantmentLevel, entity, entity.position()),
+             e -> e.apply(serverLevel, enchantmentLevel, item, entity, entity.position())
+         );
