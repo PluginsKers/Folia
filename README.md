@@ -10,6 +10,18 @@
     <p>Fork of <a href="https://github.com/PaperMC/Paper">Paper</a> which adds regionised multithreading to the dedicated server.</p>
 </div>
 
+## Area-lock hotfix build
+
+This branch is based on official Folia 26.3 build 3 (`597e413`). The pinned LeafPile submodule provides `concurrentutil` version `1.2.4-kers.1-SNAPSHOT` with the area-lock contention fix; the other LeafPile modules remain at 1.2.4.
+
+```sh
+git submodule update --init
+(cd leafpile && ./gen_sources.sh && ./gradlew :concurrentutil:publishToMavenLocal)
+./gradlew applyAllPatches build createPaperclipJar
+```
+
+The Paperclip server is written to `folia-server/build/libs/`. GitHub Actions publishes the same file as the `folia-paperclip` artifact.
+
 ## Overview
 
 Folia groups nearby loaded chunks to form an "independent region."

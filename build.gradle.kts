@@ -60,6 +60,9 @@ subprojects {
     }
 
     repositories {
+        mavenLocal {
+            content { includeVersion("ca.spottedleaf.leafpile", "concurrentutil", "1.2.4-kers.1-SNAPSHOT") }
+        }
         mavenCentral()
         maven(paperMavenPublicUrl)
     }

@@ -14,6 +14,8 @@ jobs:
     steps:
       - name: Checkout Git Repository
         uses: actions/checkout@v7
+        with:
+          submodules: true
       - name: JDK 25
         uses: actions/setup-java@v5
         with:
@@ -23,6 +25,12 @@ jobs:
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v6
 
+      - name: Build pinned LeafPile dependency
+        working-directory: leafpile
+        run: |
+          ./gen_sources.sh
+          ./gradlew :concurrentutil:publishToMavenLocal --no-daemon
+
       - name: Apply Patches
         run: |
           git config --global user.email "no-reply@github.com"
@@ -30,4 +38,12 @@ jobs:
           ./gradlew applyAllPatches --stacktrace
 
       - name: Build
-        run: ./gradlew build --stacktrace
+        run: ./gradlew build createPaperclipJar --stacktrace
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: folia-paperclip
+          path: folia-server/build/libs/folia-paperclip-*.jar
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14

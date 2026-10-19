@@ -43,7 +43,7 @@
  configurations.named(log4jPlugins.compileClasspathConfigurationName) {
      extendsFrom(configurations.compileClasspath.get())
  }
-@@ -109,11 +_,12 @@
+@@ -109,11 +_,14 @@
  }
  
  dependencies {
@@ -51,7 +51,10 @@
 +    implementation(project(":folia-api"))
      implementation(platform("ca.spottedleaf.leafpile:bom:1.2.4"))
      implementation("ca.spottedleaf.leafpile:common")
-     implementation("ca.spottedleaf.leafpile:concurrentutil")
+-    implementation("ca.spottedleaf.leafpile:concurrentutil")
++    implementation("ca.spottedleaf.leafpile:concurrentutil") {
++        version { strictly("1.2.4-kers.1-SNAPSHOT") }
++    }
      implementation("ca.spottedleaf.leafpile:converter")
 +    implementation("ca.spottedleaf.leafpile:profiler")
      implementation("org.jline:jline-terminal-ffm:4.4.6")
