@@ -53,7 +53,7 @@
      implementation("ca.spottedleaf.leafpile:common")
 -    implementation("ca.spottedleaf.leafpile:concurrentutil")
 +    implementation("ca.spottedleaf.leafpile:concurrentutil") {
-+        version { strictly("1.2.4-kers.1-SNAPSHOT") }
++        version { strictly("1.2.4-kers.2-SNAPSHOT") }
 +    }
      implementation("ca.spottedleaf.leafpile:converter")
 +    implementation("ca.spottedleaf.leafpile:profiler")

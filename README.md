@@ -12,7 +12,7 @@
 
 ## Area-lock hotfix build
 
-This branch is based on official Folia 26.3 build 3 (`597e413`). The pinned LeafPile submodule provides `concurrentutil` version `1.2.4-kers.1-SNAPSHOT` with the area-lock contention fix; the other LeafPile modules remain at 1.2.4.
+This branch is based on official Folia 26.3 build 3 (`597e413`). The pinned LeafPile submodule provides `concurrentutil` version `1.2.4-kers.2-SNAPSHOT` with the area-lock contention fix and asynchronous area tasks. Async tasks retain their area until their completion future finishes, without occupying the queue's executor thread. The other LeafPile modules remain at 1.2.4.
 
 ```sh
 git submodule update --init
