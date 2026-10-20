@@ -1,0 +1,131 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: PluginsKers <ikers@foxmail.com>
+Date: Wed, 21 Oct 2026 00:04:39 +0800
+Subject: [PATCH] perf: read village distances without the global POI lock
+
+Every zombie checking for a nearby village at night, every region tick and every chunk unload took the same per-world monitor, and readers ran pending propagation inside it. Writers now propagate their own source changes under the monitor and publish the final levels to a concurrent map that readers query without locking. Chunk unloads propagate their column once.
+
+diff --git a/net/minecraft/world/entity/ai/village/poi/PoiManager.java b/net/minecraft/world/entity/ai/village/poi/PoiManager.java
+index 816fae86e0ff6e7a7abe330dd8df3928f8309307..aa41f57467eb9b298eefcd54c9846d0d5b06a502 100644
+--- a/net/minecraft/world/entity/ai/village/poi/PoiManager.java
++++ b/net/minecraft/world/entity/ai/village/poi/PoiManager.java
+@@ -51,7 +51,54 @@ public class PoiManager extends SectionStorage<PoiSection, PoiSection.Packed> im
+ 
+     // the vanilla tracker needs to be replaced because it does not support level removes, and we need level removes
+     // to support poi unloading
+-    private final ca.spottedleaf.moonrise.common.misc.Delayed26WayDistancePropagator3D villageDistanceTracker = new ca.spottedleaf.moonrise.common.misc.Delayed26WayDistancePropagator3D();
++    private final ca.spottedleaf.moonrise.common.misc.Delayed26WayDistancePropagator3D villageDistanceTracker = new ca.spottedleaf.moonrise.common.misc.Delayed26WayDistancePropagator3D(this::onVillageDistanceChange); // Folia - lock-free village distance reads
++    // Folia start - lock-free village distance reads
++    // Fully propagated levels, read without locking; written only while holding the tracker's monitor.
++    private final ca.spottedleaf.concurrentutil.map.concurrent.longs.ConcurrentChainedLong2ReferenceHashTable<Byte> villageDistanceLevels = new ca.spottedleaf.concurrentutil.map.concurrent.longs.ConcurrentChainedLong2ReferenceHashTable<>();
++    private final LongSet changedVillageDistances = new LongOpenHashSet();
++
++    private void onVillageDistanceChange(final long section, final byte oldLevel, final byte newLevel) {
++        this.changedVillageDistances.add(section);
++    }
++
++    private int getVillageDistanceLevel(final long section) {
++        final Byte level = this.villageDistanceLevels.get(section);
++        return level == null ? 0 : level;
++    }
++
++    // Returns whether a source changed; only sources reach POI_DATA_SOURCE, so the published level tells whether the section already is one.
++    private boolean queueDistanceTracking(final long section) {
++        final boolean villageCenter = this.isVillageCenter(section);
++        if (villageCenter == (this.getVillageDistanceLevel(section) == POI_DATA_SOURCE)) {
++            return false;
++        }
++        synchronized (this.villageDistanceTracker) {
++            if (villageCenter) {
++                this.villageDistanceTracker.setSource(section, POI_DATA_SOURCE);
++            } else {
++                this.villageDistanceTracker.removeSource(section);
++            }
++        }
++        return true;
++    }
++
++    // Writers propagate their own changes, so readers never wait on propagation and never see a partial one.
++    private void publishDistanceTracking() {
++        synchronized (this.villageDistanceTracker) {
++            this.villageDistanceTracker.propagateUpdates();
++            for (final it.unimi.dsi.fastutil.longs.LongIterator iterator = this.changedVillageDistances.iterator(); iterator.hasNext();) {
++                final long section = iterator.nextLong();
++                final int level = this.villageDistanceTracker.getLevel(section);
++                if (level == 0) {
++                    this.villageDistanceLevels.remove(section);
++                } else {
++                    this.villageDistanceLevels.put(section, Byte.valueOf((byte)level));
++                }
++            }
++            this.changedVillageDistances.clear();
++        }
++    }
++    // Folia end - lock-free village distance reads
+ 
+     private static final int POI_DATA_SOURCE = 7;
+ 
+@@ -60,13 +107,11 @@ public class PoiManager extends SectionStorage<PoiSection, PoiSection.Packed> im
+     }
+ 
+     private void updateDistanceTracking(long section) {
+-        synchronized (this.villageDistanceTracker) { // Folia - region threading
+-        if (this.isVillageCenter(section)) {
+-            this.villageDistanceTracker.setSource(section, POI_DATA_SOURCE);
+-        } else {
+-            this.villageDistanceTracker.removeSource(section);
++        // Folia start - lock-free village distance reads
++        if (this.queueDistanceTracking(section)) {
++            this.publishDistanceTracking();
+         }
+-        } // Folia - region threading
++        // Folia end - lock-free village distance reads
+     }
+ 
+     @Override
+@@ -136,10 +181,19 @@ public class PoiManager extends SectionStorage<PoiSection, PoiSection.Packed> im
+         final int maxY = ca.spottedleaf.moonrise.common.util.WorldUtil.getMaxSection(this.world);
+ 
+         ca.spottedleaf.moonrise.common.util.TickThread.ensureTickThread(this.world, chunkX, chunkZ, "Unloading poi chunk off-main");
++        // Folia start - lock-free village distance reads - propagate the whole column once
++        boolean changed = false;
++        try {
+         for (int sectionY = minY; sectionY <= maxY; ++sectionY) {
+             final long sectionPos = SectionPos.asLong(chunkX, sectionY, chunkZ);
+-            this.updateDistanceTracking(sectionPos);
++            changed |= this.queueDistanceTracking(sectionPos);
++        }
++        } finally {
++            if (changed) {
++                this.publishDistanceTracking();
++            }
+         }
++        // Folia end - lock-free village distance reads
+     }
+ 
+     @Override
+@@ -422,12 +476,9 @@ public class PoiManager extends SectionStorage<PoiSection, PoiSection.Packed> im
+     }
+ 
+     public int sectionsToVillage(final SectionPos sectionPos) {
+-        synchronized (this.villageDistanceTracker) { // Folia - region threading
+         // Paper start - rewrite chunk system
+-        this.villageDistanceTracker.propagateUpdates();
+-        return convertBetweenLevels(this.villageDistanceTracker.getLevel(ca.spottedleaf.moonrise.common.util.CoordinateUtils.getChunkSectionKey(sectionPos)));
++        return convertBetweenLevels(this.getVillageDistanceLevel(ca.spottedleaf.moonrise.common.util.CoordinateUtils.getChunkSectionKey(sectionPos))); // Folia - lock-free village distance reads
+         // Paper end - rewrite chunk system
+-        } // Folia - region threading
+     }
+ 
+     private boolean isVillageCenter(final long sectionPos) {
+@@ -438,9 +489,7 @@ public class PoiManager extends SectionStorage<PoiSection, PoiSection.Packed> im
+ 
+     @Override
+     public void tick(final BooleanSupplier haveTime) {
+-        synchronized (this.villageDistanceTracker) { // Folia - region threading
+-        this.villageDistanceTracker.propagateUpdates(); // Paper - rewrite chunk system
+-        } // Folia - region threading
++        // Folia - lock-free village distance reads - writers propagate their own changes
+     }
+ 
+     @Override
