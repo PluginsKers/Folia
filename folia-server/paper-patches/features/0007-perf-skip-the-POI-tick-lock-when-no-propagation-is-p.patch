@@ -1,0 +1,21 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: PluginsKers <ikers@foxmail.com>
+Date: Sat, 24 Oct 2026 21:10:11 +0800
+Subject: [PATCH] perf: skip the POI tick lock when no propagation is pending
+
+
+diff --git a/src/main/java/ca/spottedleaf/moonrise/common/misc/Delayed26WayDistancePropagator3D.java b/src/main/java/ca/spottedleaf/moonrise/common/misc/Delayed26WayDistancePropagator3D.java
+index 460e27ab0506c83a28934800ee74ee886d4b025e..f544a2761b3c03b6621d92b75ee6fcb29ac694c7 100644
+--- a/src/main/java/ca/spottedleaf/moonrise/common/misc/Delayed26WayDistancePropagator3D.java
++++ b/src/main/java/ca/spottedleaf/moonrise/common/misc/Delayed26WayDistancePropagator3D.java
+@@ -116,6 +116,10 @@ public final class Delayed26WayDistancePropagator3D {
+         this.levelRemoveWorkQueueBitset |= (1L << level);
+     }
+ 
++    public boolean hasPendingUpdates() {
++        return !this.updatedSources.isEmpty();
++    }
++
+     public boolean propagateUpdates() {
+         if (this.updatedSources.isEmpty()) {
+             return false;

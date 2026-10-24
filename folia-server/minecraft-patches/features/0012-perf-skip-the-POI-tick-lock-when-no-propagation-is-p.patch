@@ -1,0 +1,40 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: PluginsKers <ikers@foxmail.com>
+Date: Sat, 24 Oct 2026 21:10:12 +0800
+Subject: [PATCH] perf: skip the POI tick lock when no propagation is pending
+
+Every region tick took the per-world village distance monitor even when no source had changed. Source updates now raise a volatile flag while holding the monitor, and the tick returns without locking while the flag is clear. sectionsToVillage still propagates before reading, so a stale read only defers propagation to the next tick.
+
+diff --git a/net/minecraft/world/entity/ai/village/poi/PoiManager.java b/net/minecraft/world/entity/ai/village/poi/PoiManager.java
+index 816fae86e0ff6e7a7abe330dd8df3928f8309307..b42dda487518a8b45c0deef29c696010452c5603 100644
+--- a/net/minecraft/world/entity/ai/village/poi/PoiManager.java
++++ b/net/minecraft/world/entity/ai/village/poi/PoiManager.java
+@@ -52,6 +52,10 @@ public class PoiManager extends SectionStorage<PoiSection, PoiSection.Packed> im
+     // the vanilla tracker needs to be replaced because it does not support level removes, and we need level removes
+     // to support poi unloading
+     private final ca.spottedleaf.moonrise.common.misc.Delayed26WayDistancePropagator3D villageDistanceTracker = new ca.spottedleaf.moonrise.common.misc.Delayed26WayDistancePropagator3D();
++    // Folia start - skip idle POI tick lock
++    // Read without the lock: a stale false only defers propagation, since sectionsToVillage propagates before reading.
++    private volatile boolean villageDistancePending;
++    // Folia end - skip idle POI tick lock
+ 
+     private static final int POI_DATA_SOURCE = 7;
+ 
+@@ -66,6 +70,7 @@ public class PoiManager extends SectionStorage<PoiSection, PoiSection.Packed> im
+         } else {
+             this.villageDistanceTracker.removeSource(section);
+         }
++        if (this.villageDistanceTracker.hasPendingUpdates()) this.villageDistancePending = true; // Folia - skip idle POI tick lock
+         } // Folia - region threading
+     }
+ 
+@@ -438,7 +443,9 @@ public class PoiManager extends SectionStorage<PoiSection, PoiSection.Packed> im
+ 
+     @Override
+     public void tick(final BooleanSupplier haveTime) {
++        if (!this.villageDistancePending) return; // Folia - skip idle POI tick lock
+         synchronized (this.villageDistanceTracker) { // Folia - region threading
++        this.villageDistancePending = false; // Folia - skip idle POI tick lock
+         this.villageDistanceTracker.propagateUpdates(); // Paper - rewrite chunk system
+         } // Folia - region threading
+     }
